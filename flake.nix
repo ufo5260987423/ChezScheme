@@ -18,6 +18,13 @@ stdenv.mkDerivation rec {
   buildInputs = [ 
     libtool zuo
     ncurses libiconv libX11 libuuid ];
+  patchPhase = ''
+    substituteInPlace ./makefiles/installsh \
+      --replace-warn "/usr/bin/true" "${coreutils}/bin/true"
+
+    substituteInPlace zlib/configure \
+      --replace-warn "/usr/bin/libtool" libtool
+  '';
   configurePhase = ''
     ./configure --as-is --threads --installprefix=$out --installman=$out/share/man
   '';
