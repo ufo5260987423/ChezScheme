@@ -28,4 +28,7 @@ stdenv.mkDerivation rec {
   configurePhase = ''
     ./configure --as-is --threads --installprefix=$out --installman=$out/share/man
   '';
+  buildPath=''
+    make -j8
+  '';
 }
