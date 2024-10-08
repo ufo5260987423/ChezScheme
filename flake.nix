@@ -3,6 +3,7 @@
 , darwin
 , ncurses, libiconv, libX11, libuuid, testers
 , gnumake, gcc, autoconf, automake,libtool
+,zuo
  }:
 
 stdenv.mkDerivation rec {
@@ -15,7 +16,7 @@ stdenv.mkDerivation rec {
     darwin.autoSignDarwinBinariesHook
   ];
   buildInputs = [ 
-    libtool
+    libtool zuo
     ncurses libiconv libX11 libuuid ];
   configurePhase = ''
     ./configure --as-is --threads --installprefix=$out --installman=$out/share/man
