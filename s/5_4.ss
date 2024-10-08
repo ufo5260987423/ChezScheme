@@ -32,10 +32,10 @@
             ($oops 'substring
                    "~s and ~s are not valid start/end indices for ~s"
                    m n s1))
-         (let ([s2 ($make-uninitialized-string (fx- n m))])
-           (do ([j 0 (fx+ j 1)] [i m (fx+ i 1)])
-               ((fx= i n) s2)
-             (string-set! s2 j (string-ref s1 i)))))))
+          (let* ([len (fx- n m)]
+              [s2 ($make-uninitialized-string len)])
+            (string-copy! s1 m s2 0 len)
+            s2))))
 
 (let ()
   (define do-string-append2
