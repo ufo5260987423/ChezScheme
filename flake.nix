@@ -15,6 +15,7 @@ stdenv.mkDerivation rec {
   ] ++ lib.optionals (stdenv.hostPlatform.isDarwin && stdenv.hostPlatform.isAarch64) [
     darwin.autoSignDarwinBinariesHook
   ];
+  env.NIX_CFLAGS_COMPILE = lib.optionalString stdenv.cc.isGNU "-Wno-error=format-truncation";
   buildInputs = [ 
     libtool zuo
     ncurses libiconv libX11 libuuid ];
