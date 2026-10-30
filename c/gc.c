@@ -18,7 +18,6 @@
 #ifndef WIN32
 #include <sys/wait.h>
 #endif /* WIN32 */
-#include "popcount.h"
 #include <assert.h>
 
 /* 
@@ -383,6 +382,11 @@ static ptr sweep_from;
 
 static int in_parallel_sweepers = 0;
 
+#ifdef USE_PAR_SWEEPERS_WORKAROUND
+FORCEINLINE int get_in_parallel_sweepers() { return in_parallel_sweepers; }
+# define PAR_SWEEPERS_WORKAROUND() int in_parallel_sweepers = get_in_parallel_sweepers()
+#endif
+
 #define HAS_SWEEPER_WRT(t_tc, tc) 1
 
 # define GC_MUTEX_ACQUIRE() alloc_mutex_acquire()
@@ -460,6 +464,10 @@ static void sweep_dirty(thread_gc *tgc);
 # define PARALLEL_UNUSED    /* empty */
 # define NO_PARALLEL_UNUSED UNUSED
 
+#endif
+
+#ifndef PAR_SWEEPERS_WORKAROUND
+# define PAR_SWEEPERS_WORKAROUND() do { } while (0)
 #endif
 
 #define SWEEP_NO_CHANGE        0
@@ -912,7 +920,8 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
 #ifndef NO_DIRTY_NEWSPACE_POINTERS
     S_G.new_dirty_cards = NULL;
 #endif /* !NO_DIRTY_NEWSPACE_POINTERS */
-    S_G.must_mark_gen0 = 0;
+    if (MIN_TG > 0)
+      S_G.must_mark_gen0 = 0;
 
     setup_sweepers(tgc); /* maps  threads to sweepers */
 
@@ -1709,6 +1718,15 @@ ptr GCENTRY(ptr tc, ptr count_roots_ls) {
     S_G.g0_bytes_after_last_gc = S_G.bytes_of_generation[0];
 
     if (MAX_CG >= S_G.min_free_gen) S_free_chunks();
+
+#if defined(WRITE_XOR_EXECUTE_CODE)
+    /* any new allocation of code needs to happen on a new page */
+    for (ls = S_threads; ls != Snil; ls = Scdr(ls)) {
+      ptr t_tc = (ptr)THREADTC(Scar(ls));
+      for (g = 0; g <= MAX_TG; g++)
+        S_close_off_thread_local_segment(t_tc, space_code, g);
+    }
+#endif
 
     S_flush_instruction_cache(tc);
     S_thread_end_code_write(tc, MAX_TG, 0, NULL, 0);

@@ -204,6 +204,8 @@ IBOOL Sactivate_thread(void) { /* create or reactivate current thread */
   }
 }
 
+#if !defined(WRITE_XOR_EXECUTE_CODE)
+
 int S_activate_thread(void) { /* Like Sactivate_thread(), but returns a mode to revert the effect */
   ptr tc = get_thread_context();
 
@@ -231,6 +233,17 @@ void S_unactivate_thread(int mode) { /* Reverts a previous S_activate_thread() e
   }
 }
 
+#else
+
+int S_activate_thread(void) {
+    return unactivate_mode_noop;
+}
+
+void S_unactivate_thread(UNUSED int mode) {
+}
+
+#endif
+
 void Sdeactivate_thread(void) { /* deactivate current thread */
   ptr tc = get_thread_context();
   if (tc != (ptr)0) deactivate_thread(tc)
@@ -238,9 +251,9 @@ void Sdeactivate_thread(void) { /* deactivate current thread */
 
 int Sdestroy_thread(void) { /* destroy current thread */
   ptr tc = get_thread_context();
-  if (tc != (ptr)0 && destroy_thread(tc)) {
-    s_thread_setspecific(S_tc_key, 0);
-    return 1;
+  if (tc != (ptr)0) {
+    s_thread_setspecific(S_tc_key, NULL);
+    if (destroy_thread(tc)) return 1;
   }
   return 0;
 }
@@ -263,7 +276,7 @@ static IBOOL destroy_thread(ptr tc) {
       S_scan_dirty((ptr *)TO_VOIDP(EAP(tc)), (ptr *)TO_VOIDP(REAL_EAP(tc)));
 
      /* close off thread-local allocation */
-      S_thread_start_code_write(tc, static_generation, 0, NULL, 0);
+      S_thread_start_code_write(tc, 0, 1, NULL, 0);
       {
         ISPC s; IGEN g;
         thread_gc *tgc = THREAD_GC(tc);
@@ -272,7 +285,7 @@ static IBOOL destroy_thread(ptr tc) {
             if (tgc->next_loc[g][s])
               S_close_off_thread_local_segment(tc, s, g);
       }
-      S_thread_end_code_write(tc, static_generation, 0, NULL, 0);
+      S_thread_end_code_write(tc, 0, 1, NULL, 0);
 
       alloc_mutex_release();
 
@@ -359,8 +372,8 @@ static s_thread_rv_t start_thread(void *p) {
     is static, so we can access it. */
 
  /* find and destroy our thread */
-  destroy_thread(tc);
   s_thread_setspecific(S_tc_key, NULL);
+  destroy_thread(tc);
 
   s_thread_return;
 }

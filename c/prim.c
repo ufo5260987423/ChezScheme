@@ -110,6 +110,12 @@ static ptr s_get_thread_context(void) {
   return get_thread_context();
 }
 
+#ifdef WRITE_XOR_EXECUTE_CODE
+static void S_deactivate_thread(void) { }
+#else
+# define S_deactivate_thread Sdeactivate_thread
+#endif
+
 static void create_c_entry_vector(void) {
     INT i;
 
@@ -134,9 +140,13 @@ static void create_c_entry_vector(void) {
     S_install_c_entry(CENTRY_raw_tc_mutex, TO_PTR(&S_tc_mutex));
     S_install_c_entry(CENTRY_raw_terminated_cond, TO_PTR(&S_terminated_cond));
     S_install_c_entry(CENTRY_activate_thread, proc2ptr(S_activate_thread));
-    S_install_c_entry(CENTRY_deactivate_thread, proc2ptr(Sdeactivate_thread));
     S_install_c_entry(CENTRY_unactivate_thread, proc2ptr(S_unactivate_thread));
+    S_install_c_entry(CENTRY_deactivate_thread, proc2ptr(S_deactivate_thread));
 #endif /* PTHREADS */
+    S_install_c_entry(CENTRY_save_errno, proc2ptr(S_save_errno));
+#ifdef WIN32
+    S_install_c_entry(CENTRY_save_last_error, proc2ptr(S_save_last_error));
+#endif
     S_install_c_entry(CENTRY_handle_values_error, proc2ptr(S_handle_values_error));
     S_install_c_entry(CENTRY_handle_mvlet_error, proc2ptr(S_handle_mvlet_error));
     S_install_c_entry(CENTRY_handle_arg_error, proc2ptr(S_handle_arg_error));
@@ -167,6 +177,10 @@ void S_check_c_entry_vector() {
           || i == CENTRY_unactivate_thread)
         continue;
 #endif /* NOT PTHREADS */
+#ifndef WIN32
+      if (i == CENTRY_save_last_error)
+        continue;
+#endif
       if (Svector_ref(S_G.c_entry_vector, i) == Sfalse) {
         fprintf(stderr, "c_entry_vector entry %d is uninitialized\n", i);
         S_abnormal_exit();
@@ -234,7 +248,7 @@ static void s_instantiate_code_object(void) {
     cookie = S_get_scheme_arg(tc, 2);
     proc = S_get_scheme_arg(tc, 3);
 
-    S_thread_start_code_write(tc, 0, 0, NULL, 0);
+    S_thread_start_code_write(tc, 0, 1, NULL, 0);
 
     new = S_code(tc, CODETYPE(old), CODELEN(old));
 
@@ -291,7 +305,7 @@ static void s_instantiate_code_object(void) {
     }
     S_flush_instruction_cache(tc);
 
-    S_thread_end_code_write(tc, 0, 0, NULL, 0);
+    S_thread_end_code_write(tc, 0, 1, NULL, 0);
     
 #ifdef PORTABLE_BYTECODE
     if (desc == (ptr)0) S_error_abort("did not find callable type description");
@@ -305,7 +319,7 @@ static void s_link_code_object(ptr co, ptr objs) {
     ptr t, tc = get_thread_context();
     uptr a, m, n;
 
-    S_thread_start_code_write(tc, 0, 0, NULL, 0);
+    S_thread_start_code_write(tc, 0, 0, &CODEIT(co, 0), CODELEN(co));
     t = CODERELOC(co);
     m = RELOCSIZE(t);
     a = 0;
@@ -324,7 +338,7 @@ static void s_link_code_object(ptr co, ptr objs) {
         S_set_code_obj("gc", RELOC_TYPE(entry), co, a, Scar(objs), item_off);
         objs = Scdr(objs);
     }
-    S_thread_end_code_write(tc, 0, 0, NULL, 0);
+    S_thread_end_code_write(tc, 0, 0, &CODEIT(co, 0), CODELEN(co));
 }
 
 static INT s_check_heap_enabledp(void) {

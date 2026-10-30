@@ -2058,7 +2058,9 @@
                                 (box 88)
                                 "" '#() '#vu8() (make-fxvector 0) (make-flvector 0)
                                 (string->immutable-string "") (vector->immutable-vector '#())
-                                (bytevector->immutable-bytevector '#vu8())))
+                                (bytevector->immutable-bytevector '#vu8())
+                                (make-ftype-pointer ftype-pointer 16)
+                                (make-ftype-scheme-object-pointer #t 1)))
     (define (same-vfasl-content? v)
       (andmap (lambda (a b)
                 (or (eqv? a b)
@@ -2078,6 +2080,16 @@
                                  (vfasl-demo-x b))
                          (equal? (vfasl-demo-y a)
                                  (vfasl-demo-y b)))
+                    (and (ftype-scheme-object-pointer? a)
+                         (ftype-scheme-object-pointer? b)
+                         (equal? (ftype-scheme-object-pointer-object a)
+                                 (ftype-scheme-object-pointer-object b))
+                         (eqv? (ftype-scheme-object-pointer-offset a)
+                               (ftype-scheme-object-pointer-offset b)))
+                    (and (ftype-pointer? a)
+                         (ftype-pointer? b)
+                         (eqv? (ftype-pointer-address a)
+                               (ftype-pointer-address b)))
                     (begin
                       (printf "~s ~s\n" a b)
                       #f)))
@@ -2102,7 +2114,7 @@
 
 (mat cost-center
   (error? ; wrong number of arguments
-    (make-cost-center 'foo))
+    (make-cost-center 'foo 'bar))
 
   (error? ; foo is not a cost center
     (with-cost-center 'foo (lambda () 5)))
@@ -2122,8 +2134,16 @@
   (error? ; #\c is not a cost center
     (reset-cost-center! #\c))
 
+  (error? ; "test" is not a cost center
+    (cost-center-name "test"))
+
   (let ([cc (make-cost-center)])
-    (cost-center? cc))
+    (cost-center? cc)
+    (string=? (format "~a" cc) "#<cost center>"))
+
+  (let ([cc (make-cost-center 'foo)])
+    (eq? (cost-center-name cc) 'foo)
+    (string=? (format "~a" cc) "#<cost center foo>"))
 
   ;;; instruction cost center tests
   ((lambda (x)
@@ -4242,16 +4262,16 @@
       ;;; set-cdr! as it does not appear that frequently in tests.ss
       ;;;
       ;;;  before
-      ;;;      +--+--+    +--+--+    +--+--+         +--+--+    +--+--+    +--+--+
-      ;;;      | 1|------>| 2|------>| 3|------> ... | 6|------>| 7|------>| 8|#f|
-      ;;;      +--+--+    +--+--+    +--+--+         +--+--+    +--+--+    +--+--+
+      ;;;      +--+--+    +--+--+    +--+--+         +--+--+    +--+--+    +--+----+
+      ;;;      | 1|------>| 2|------>| 3|------> ... | 6|------>| 7|------>| 8| #f |
+      ;;;      +--+--+    +--+--+    +--+--+         +--+--+    +--+--+    +--+----+
       ;;;       ^^
       ;;;       yx
       ;;;
       ;;;  after
-      ;;;      +--+--+    +--+--+         +--+--+    +--+--+    +--+--+    +--+--+
-      ;;;      | 4|------>| 5|------> ... | 8|------>| 1|------>| 2|------>| 3|#f|
-      ;;;      +--+--+    +--+--+         +--+--+    +--+--+    +--+--+    +--+--+
+      ;;;      +--+--+    +--+--+         +--+--+    +--+--+    +--+--+    +--+----+
+      ;;;      | 4|------>| 5|------> ... | 8|------>| 1|------>| 2|------>| 3| #f |
+      ;;;      +--+--+    +--+--+         +--+--+    +--+--+    +--+--+    +--+----+
       ;;;       ^                                     ^
       ;;;       x                                     y
       (let ([x (cons 1 (cons 2 (cons 3 (cons 4 (cons 5 (cons 6 (cons 7 (cons 8 '()))))))))])
@@ -4691,7 +4711,7 @@
              (#2%display 1))))
 )
 
-(unless (memq (machine-type) '(arm32le tarm32le arm64le tarm64le arm64osx tarm64osx ; timestamp counter tends to be priviledged on Arm
+(unless (memq (machine-type) '(arm32le tarm32le arm64le tarm64le arm64osx tarm64osx armv7le tarmv7le ; timestamp counter tends to be priviledged on Arm
                                        arm64ios tarm64ios arm64nt tarm64nt
                                        pb pb32l pb32b pb64l pb64b tpb tpb32l tpb32b tpb64l tpb64b)) ; doesn't increment for pb
   (mat $read-time-stamp-counter
@@ -5470,7 +5490,46 @@
            (loop))))
      #t))
 
+  ;; make sure large immobile bytevectors are really immobile
+  (let loop ([i 10])
+    (cond
+      [(zero? i) #t]
+      [else
+       (let* ([bv (make-immobile-bytevector #x200000)]
+              [addr (object->reference-address bv)])
+         (collect 0 0)
+         (collect 0 1)
+         (and (eqv? addr (object->reference-address bv))
+              (loop (sub1 i))))]))
+
   )
+
+(mat immobile-implementation-restriction (parameters [optimize-level 0])
+  (let ([too-large (+ (greatest-fixnum) 1)])
+    (define (implementation-restriction? message thunk)
+      (guard (c [else (and (implementation-restriction-violation? c)
+                           (equal? (condition-message c) message)
+                           (equal? (condition-irritants c) (list too-large)))])
+        (thunk)
+        #f))
+    (define (assertion? thunk)
+      (guard (c [else (and (assertion-violation? c)
+                           (not (implementation-restriction-violation? c)))])
+        (thunk)
+        #f))
+    (and
+      (implementation-restriction? "~s exceeds the maximum vector length"
+        (lambda () (make-immobile-vector too-large)))
+      (implementation-restriction? "~s exceeds the maximum vector length"
+        (lambda () (make-immobile-vector too-large #f)))
+      (assertion? (lambda () (make-immobile-vector -1)))
+      (assertion? (lambda () (make-immobile-vector -1 #f)))
+      (implementation-restriction? "~s exceeds the maximum bytevector length"
+        (lambda () (make-immobile-bytevector too-large)))
+      (implementation-restriction? "~s exceeds the maximum bytevector length"
+        (lambda () (make-immobile-bytevector too-large 0)))
+      (assertion? (lambda () (make-immobile-bytevector -1)))
+      (assertion? (lambda () (make-immobile-bytevector -1 0))))))
 
 (mat compacting
   ;; try to provoke the GC into putting a record into marked
@@ -5522,4 +5581,65 @@
    (if (fx= (optimize-level) 3)
        '(lambda (x) (#3%fx+ 2 (#3%fx+ 1 x)))
        '(lambda (x) (#2%fx+ 2 (#3%fx+ 1 x)))))
+  )
+
+(mat black-box
+  (begin
+    ;; detect whether `expt` work is done by counting allocation
+    (define-syntax does-the-work-at-run-time?
+      (syntax-rules ()
+        [(_ opt? e)
+         (equal?
+          opt?
+          (let ([SLOP 100])
+            (with-interrupts-disabled
+             (let ([before (bytes-allocated)])
+               e
+               (let ([after (bytes-allocated)])
+                 (> after (+ before SLOP)))))))]))
+    #t)
+
+  (does-the-work-at-run-time?
+   (or (not (enable-cp0))
+       (#%$suppress-primitive-inlining))
+   (let ([to-power 100])
+     (let loop ([i 1000])
+       (unless (zero? i)
+         ;; call to `expt` is likely optimized away entirely, since there's
+         ;; no effect and the result is unused:
+         (expt 2 to-power)
+         (loop (sub1 i))))))
+
+  (does-the-work-at-run-time?
+   (or (not (enable-cp0))
+       (#%$suppress-primitive-inlining))
+   (let ([to-power 100])
+     (let loop ([i 1000])
+       (unless (zero? i)
+         ;; likely optimized to just returning a folded constant, instead of
+         ;; calling `expt` each iteration:
+         (black-box (expt 2 to-power))
+         (loop (sub1 i))))))
+
+  (does-the-work-at-run-time?
+   (not (and (enable-cp0)
+             (not (#%$suppress-primitive-inlining))
+             (eqv? 3 (optimize-level))))
+   (let ([to-power (black-box 100)])
+     (let loop ([i 1000])
+       (unless (zero? i)
+         ;; in safe mode, likely calls `expt`, because `to-power` is not known
+         ;; to be a number, but likely optimized away with `(optimize-level 3)`:
+         (expt 2 to-power)
+         (loop (sub1 i))))))
+
+  (does-the-work-at-run-time?
+   #t
+   (let ([to-power (black-box 100)])
+   (let loop ([i 1000])
+     (unless (zero? i)
+       ;; arithmetic really performed every iteration, since `to-power` value
+       ;; is assumed unknown, and `expt` result is assumed to be used
+       (black-box (expt 2 to-power))
+       (loop (sub1 i))))))
   )

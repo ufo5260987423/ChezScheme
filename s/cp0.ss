@@ -133,7 +133,7 @@
   (define ctrtd-opaque-known #b0000001)
   (define ctrtd-sealed-known #b0000010)
 
-  (define base-ctrtd ($make-record-type #!base-rtd #!base-rtd "ctrtd" '((immutable flags)) #t #f))
+  (define base-ctrtd ($make-record-type #!base-rtd #!base-rtd "ctrtd" '((immutable flags)) #t #f #f))
   (define ctrtd? (record-predicate base-ctrtd))
   (define ctrtd-flags (record-accessor base-ctrtd 0))
 
@@ -1951,60 +1951,33 @@
       ; opnd has already been visited
       (lambda (maybe-src id opnd ctxt sc wd name moi)
         (let ((rhs (result-exp (operand-value opnd))))
+          (define (copy-e e)
+            (residualize-ref maybe-src
+              (nanopass-case (Lsrc Expr) e
+                [(ref ,maybe-src ,x)
+                 (guard (not (prelex-was-assigned x))
+                        ;; protect against (letrec ([x x]) ---)
+                        (not (eq? x id)))
+                 (when (prelex-was-multiply-referenced id)
+                   (set-prelex-was-multiply-referenced! x #t))
+                 x]
+                [else id])
+              sc))
           (nanopass-case (Lsrc Expr) rhs
             [(quote ,d) rhs]
             [(record-type ,rtd ,e)
-             `(record-type ,rtd
-                ,(residualize-ref maybe-src
-                   (nanopass-case (Lsrc Expr) e
-                     [(ref ,maybe-src ,x)
-                      (guard (not (prelex-was-assigned x))
-                        ; protect against (letrec ([x x]) ---)
-                        (not (eq? x id)))
-                      (when (prelex-was-multiply-referenced id)
-                        (set-prelex-was-multiply-referenced! x #t))
-                      x]
-                     [else id])
-                   sc))]
+             `(record-type ,rtd ,(copy-e e))]
             [(record-cd ,rcd ,rtd-expr ,e)
-             `(record-cd ,rcd ,rtd-expr
-                ,(residualize-ref maybe-src
-                   (nanopass-case (Lsrc Expr) e
-                     [(ref ,maybe-src ,x)
-                      (guard (not (prelex-was-assigned x))
-                        ; protect against (letrec ([x x]) ---)
-                        (not (eq? x id)))
-                      (when (prelex-was-multiply-referenced id)
-                        (set-prelex-was-multiply-referenced! x #t))
-                      x]
-                     [else id])
-                   sc))]
+             `(record-cd ,rcd ,rtd-expr ,(copy-e e))]
             [(immutable-list (,e* ...) ,e)
-             `(immutable-list (,e* ...)
-                ,(residualize-ref maybe-src
-                   (nanopass-case (Lsrc Expr) e
-                     [(ref ,maybe-src ,x)
-                      (guard (not (prelex-was-assigned x))
-                        ; protect against (letrec ([x x]) ---)
-                        (not (eq? x id)))
-                      (when (prelex-was-multiply-referenced id)
-                        (set-prelex-was-multiply-referenced! x #t))
-                      x]
-                     [else id])
-                   sc))]
+             `(immutable-list (,e* ...) ,(copy-e e))]
             [(immutable-vector (,e* ...) ,e)
-             `(immutable-vector (,e* ...)
-                ,(residualize-ref maybe-src
-                   (nanopass-case (Lsrc Expr) e
-                     [(ref ,maybe-src ,x)
-                      (guard (not (prelex-was-assigned x))
-                        ; protect against (letrec ([x x]) ---)
-                        (not (eq? x id)))
-                      (when (prelex-was-multiply-referenced id)
-                        (set-prelex-was-multiply-referenced! x #t))
-                      x]
-                     [else id])
-                   sc))]
+             `(immutable-vector (,e* ...) ,(copy-e e))]
+            [(foreign (,conv* ...) ,name ,e (,arg-type* ...) ,result-type)
+             ;; use site of an atomic foreign procedure is always a call, so it's
+             ;; always worth inlining to expose the atomic call
+             (guard (memq 'atomic conv*))
+             `(foreign (,conv* ...) ,name ,(copy-e e) (,arg-type* ...) ,result-type)]
             [(ref ,maybe-src1 ,x)
              (cond
                [(and (not (prelex-was-assigned x))
@@ -2259,10 +2232,6 @@
                                     body)))))
                      ($sputprop 'prim 'key (foo 'prim)) ...)))))))
 
-      (define generic-nan?
-        (lambda (x)
-          (and (flonum? x) ($nan? x))))
-
       (define fl-nan?
         (lambda (x)
           ($nan? x)))
@@ -2270,6 +2239,10 @@
       (define cfl-nan?
         (lambda (z)
           (and ($nan? (cfl-real-part z)) ($nan? (cfl-imag-part z)))))
+
+      (define generic-cfl-nan?
+        (lambda (x)
+          (and (cflonum? x) (cfl-nan? x))))
 
       (define exact-zero?
         (lambda (x)
@@ -2459,6 +2432,24 @@
           [(who e) (visit-and-maybe-extract* addr-int?  ([de e])
                      (residualize-seq '() (list who e) ctxt)
                      true-rec)]))
+
+      (let ()
+        (define null-fptr-constant?
+          (lambda (e1)
+            (cp0-constant? (lambda (d)
+                             (and ($ftype-pointer? d)
+                                  (eqv? 0 (ftype-pointer-address d))))
+                           e1)))
+        (define-inline 2 ftype-pointer-address
+          [(e) (let ([xval (value-visit-operand! e)])
+                 (nanopass-case (Lsrc Expr) (result-exp xval)
+                   [(call ,preinfo ,pr ,e1 ,e2 ,e3)
+                    (guard (and (eq? (primref-name pr) '$fptr-&ref)
+                                (all-set? (prim-mask unsafe) (primref-flags pr))
+                                (null-fptr-constant? e1)))
+                    (residualize-seq '() (list e) ctxt)
+                    e2]
+                   [else #f]))]))
 
       (define-inline 2 (memq memv member assq assv assoc)
         [(x ls)
@@ -3095,12 +3086,19 @@
             (nanopass-case (Lsrc Expr) e
               [(quote ,d) (flonum? d)]
               [(call ,preinfo ,pr ,e* ...) (eq? 'flonum ($sgetprop (primref-name pr) '*result-type* #f))]
+              [(call ,preinfo (foreign (,conv* ...) ,name ,e (,arg-type* ...) ,result-type) ,e* ...)
+               (safe-assert (memq 'atomic conv*))
+               (nanopass-case (Ltype Type) result-type
+                 [(fp-double-float) #t]
+                 [(fp-single-float) #t]
+                 [else #f])]
               [else #f])))
 
         ; handling nans here using the support for handling exact zero in
         ; the multiply case.  maybe shouldn't bother with nans anyway.
-        (partial-folder plus + + 0 generic-nan?)
+        (partial-folder plus + + 0 generic-cfl-nan?)
         (partial-folder plus fx+ + 0 (lambda (x) #f) 3)
+        (partial-folder plus $fxx+ + 0 (lambda (x) #f))
         (r6rs-fixnum-partial-folder plus r6rs:fx+ fx+ + 0 (lambda (x) #f) 3)
         (r6rs-fixnum-partial-folder plus fx+/wraparound fx+/wraparound + 0 (lambda (x) #f) 3)
         (partial-folder plus fl+ fl+ -0.0 fl-nan? #f obviously-fl?)
@@ -3118,6 +3116,7 @@
         ; to 0, but (/ 0 n) is only 0 if divisor turns out not to be 0.
         (partial-folder minus - - 0)
         (partial-folder minus fx- - 0)
+        (partial-folder minus $fxx- - 0)
         (r6rs-fixnum-partial-folder minus r6rs:fx- fx- - 0)
         (r6rs-fixnum-partial-folder minus fx-/wraparound fx-/wraparound - 0)
         (partial-folder minus fl- fl- -0.0)
@@ -3391,7 +3390,7 @@
       (define-inline 3 fxdiv-and-mod
         [(x y)
          (and likely-to-be-compiled?
-              (cp0-constant? (result-exp (value-visit-operand! y)))
+              (cp0-constant? target-fixnum-power-of-two (result-exp (value-visit-operand! y)))
               (cp0
                 (let ([tx (cp0-make-temp #t)] [ty (cp0-make-temp #t)])
                   (let ([refx (build-ref tx)] [refy (build-ref ty)])
@@ -3501,8 +3500,12 @@
                          (values #f ctrtd-opaque-known)
                          (values #f 0)))]
                 [else (values #f 0)])))
+        (define (get-alt-pm x)
+          (nanopass-case (Lsrc Expr) (if x (result-exp (value-visit-operand! x)) false-rec)
+            [(quote ,d) d]
+            [else #f]))
         (let ()
-          (define (mrt ?parent ?name ?fields maybe-?sealed maybe-?opaque ctxt level prim primname opnd*)
+          (define (mrt ?parent ?name ?fields maybe-?sealed maybe-?opaque maybe-?alt-pm ctxt level prim primname opnd*)
             (or (nanopass-case (Lsrc Expr) (result-exp (value-visit-operand! ?name))
                   [(quote ,d)
                    (and (gensym? d)
@@ -3519,11 +3522,12 @@
                     (get-fields ?fields
                       (lambda (fields)
                         (let-values ([(sealed? sealed-flag) (get-sealed maybe-?sealed)]
-                                     [(opaque? opaque-flag) (get-opaque maybe-?opaque prtd)])
+                                     [(opaque? opaque-flag) (get-opaque maybe-?opaque prtd)]
+                                     [(alt-pm) (get-alt-pm maybe-?alt-pm)])
                           (cond
                             [(guard (c [#t #f])
                                ($make-record-type base-ctrtd prtd "tmp" fields
-                                 sealed? opaque? (fxlogor sealed-flag opaque-flag))) =>
+                                  sealed? opaque? alt-pm (fxlogor sealed-flag opaque-flag))) =>
                              (lambda (ctrtd)
                                (residualize-seq opnd* '() ctxt)
                                `(record-type ,ctrtd
@@ -3533,16 +3537,16 @@
 
           (define-inline 2 make-record-type
             [(?name ?fields)
-             (mrt #f ?name ?fields #f #f ctxt level make-record-type 'make-record-type
+             (mrt #f ?name ?fields #f #f #f ctxt level make-record-type 'make-record-type
                (list ?name ?fields))]
             [(?parent ?name ?fields)
-             (mrt ?parent ?name ?fields #f #f ctxt level make-record-type 'make-record-type
+             (mrt ?parent ?name ?fields #f #f #f ctxt level make-record-type 'make-record-type
                (list ?parent ?name ?fields))])
 
           (define-inline 2 $make-record-type
-            [(?base-id ?parent ?name ?fields ?sealed ?opaque . ?extras)
-             (mrt ?parent ?name ?fields ?sealed ?opaque ctxt level $make-record-type '$make-record-type
-               (list* ?base-id ?parent ?name ?fields ?sealed ?opaque ?extras))]))
+            [(?base-id ?parent ?name ?fields ?sealed ?opaque ?alt-pm . ?extras)
+             (mrt ?parent ?name ?fields ?sealed ?opaque ?alt-pm ctxt level $make-record-type '$make-record-type
+               (list* ?base-id ?parent ?name ?fields ?sealed ?opaque ?alt-pm ?extras))]))
         (let ()
           (define (mrtd ?parent ?uid ?fields ?sealed ?opaque ctxt level prim primname opnd*)
             (or (nanopass-case (Lsrc Expr) (result-exp (value-visit-operand! ?uid))
@@ -3672,11 +3676,20 @@
                                  [(case-lambda ,preinfo ,cl* ...) #t]
                                  [(seq (profile ,src) (case-lambda ,preinfo ,cl* ...)) #t]
                                  [else #f])))
+                        (define (protocol-ok?-or-level d pctrcd)
+                          (or (procedure? d)
+                              (and (eq? d #f)
+                                   (or (not pctrcd)
+                                       (nanopass-case (Lsrc Expr) (ctrcd-protocol-expr pctrcd)
+                                         [(quote ,d) (eq? d #f)]
+                                         [else level])))))
                         (let* ([whole-protocol-expr (value-visit-operand! ?protocol)]
                                [result-protocol-expr (result-exp whole-protocol-expr)])
                           (cond
                             [(nanopass-case (Lsrc Expr) result-protocol-expr
-                               [(quote ,d) (and (or (eq? d #f) (procedure? d)) 3)]
+                               [(quote ,d)
+                                (let ([lvl (protocol-ok?-or-level d pctrcd)])
+                                  (if (eq? lvl #t) 3 lvl))]
                                [(ref ,maybe-src ,x)
                                 (and (not (prelex-was-assigned x))
                                      (if (opnd-lambda? (prelex-operand x)) 3 level))]

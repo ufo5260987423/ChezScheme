@@ -1,5 +1,5 @@
-Building Chez Scheme Version 10.0.0
-Copyright 1984-2024 Cisco Systems, Inc.
+Building Chez Scheme Version 10.5.0
+Copyright 1984-2026 Cisco Systems, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ On Unix variants:
 
 On Windows:
 
- * Microsoft Visual Studio 2022, 2019, 2017, or 2015
+ * Microsoft Visual Studio 2026, 2022, 2019, or 2017
 
 
 GETTING STARTED
@@ -36,7 +36,7 @@ Chez Scheme machine type, which can be used to build native
 machine types. You can also create initial boot files using
 an existing Chez Scheme build.
 
-In you're on Windows, see the WINDOWS VIA COMMAND PROMPT section later
+If you're on Windows, see the WINDOWS VIA COMMAND PROMPT section later
 in this file. Otherwise, carry on to CONFIGURING AND BUILDING.
 
 
@@ -149,7 +149,7 @@ information on the supported options.
 For platforms without support for native-code compilation in Chez
 Scheme, use a machine specification like `-m=tpb64l`, which is a
 threaded, 64-bit, little-endian build. The "configure" script will
-still attept to infer compilation and linking flags for the kernel; if
+still attempt to infer compilation and linking flags for the kernel; if
 you need to give it a hint, you can use the `--os` flag with something
 like `--os=tXle`, which indicates a threaded configuration (due to the
 leading "t") on Linux (due to the trailing "le").
@@ -277,7 +277,7 @@ The makefile supports several targets:
    Use "auto" for <machine type> as a shorthand for an inferred
    machine type after configuring with `--pb`.
 
-   When using `zuo`, the `boot` and bootquick` targets take arguments
+   When using `zuo`, the `boot` and `bootquick` targets take arguments
    instead of using variables. So, the corresponding commands are
    `zuo . boot <machine-type>` and `zuo . bootquick <machine-type>`.
 
@@ -370,10 +370,8 @@ where <machine type> is one of the following:
  * ti3nt     (32-bit Intel threaded)
  * i3nt      (32-bit Intel non-threaded)
 
-If you're using Visual Studio 2022 or 2019, install "Desktop
-development with C++" on the "Workloads" tabs and the "C++ 20[xx]
-Redistributable MSMs" on the "Individual components" tab under the
-"Compilers, build tools, and runtimes" section. The `build.bat` script
+If you're using Visual Studio 2026, 2022 or 2019, install "Desktop
+development with C++" on the "Workloads" tab. The `build.bat` script
 will use `c\vs.bat` to find and set up Microsoft Visual Studio
 command-line tools automatically for <machine type>; supply `/keepvs`
 if you have set up command-line tools already so that `c\vs.bat`
@@ -383,15 +381,15 @@ The generated executables "scheme.exe" and "petite.exe" are in
 "<machine type>\bin\<machine type>", and each relies on generated boot
 files in "..\boot\<machine type>" relative to the executable. The
 executables are dynamically linked against the Microsoft Visual C++
-run-time library vcruntime140.dll. If you distribute the executables
+run-time library "vcruntime140.dll". If you distribute the executables
 to a different system, be sure to include the redistributable run-time
 library.
 
 The `build.bat` script creates and uses an `nmake`-compatible makefile
-to build `zuo.exe` as its first step and as its only step is `/config`
+to build `zuo.exe` as its first step and as its only step if `/config`
 is supplied. You can use `zuo` to drive targets described in DETAILS
-above, but you must Microsoft Visual Studio command-line tools set up
-already (perhaps using `c/vs.bat`).
+above, but you must have Microsoft Visual Studio command-line tools set
+up already (perhaps using `c/vs.bat`).
 
 By default, `build.bat` not only builds the "scheme.exe" executable,
 it also builds DLLs and libraries to support four linking
@@ -489,6 +487,14 @@ the Cygwin values are incompatible with the Microsoft C Runtime
 Library.
 
 
+OPENBSD
+
+Build Chez Scheme on a filesystem that is mounted with the `wxallowed`
+option, and ensure that Chez Scheme is installed on a filesystem with
+`wxallowed`. Alternatively, configure with `--enable-wx` as described
+below.
+
+
 EMSCRIPTEN
 
 To target WebAssembly via Emscripten and `emcc`, use the
@@ -539,9 +545,41 @@ Finally, configure the Emscripten build to use "demo.boot":
  make
 
 
+PLATFORMS THAT ENFORCE W^X
+
+Chez Scheme can generate machine code at run time and modify code
+during garbage collection, and those actions can run afoul of W^X
+enforcement (write--execute exclusivity of memory) by the operating
+system. W^X enforcement particularly constrains the interaction of
+threads, code generation, and memory management. On some platforms,
+conforming to W^X requires disabling the `__collect_safe` convention
+(by making it ignored) for foreign procedure calls and callables.
+
+Use
+
+   ./configure --enable-wx
+
+to enable portable W^X cooperation and disable the `__collect_safe`
+convention. Using `--enable-wx` on OpenBSD, for example, supports
+building and installing on filesystems without `wxallowed`.
+
+Otherwise, the default handling of W^X depends on the platform:
+
+ * OpenBSD: Assumes W^X is disabled, which is why a default build
+   needs a filesystem with `wxallowed`.
+
+ * NetBSD: Uses `paxctl +m` to disable W^X enforcement for the
+   generated `scheme` executable.
+
+ * iOS: Always builds as if configured with `--enable-wx`.
+
+ * Mac OS on AArch64: Use a per-thread W^X disposition to support
+   `__collect_safe`, so `--enable-wx` is not needed.
+
+
 CROSS COMPILING
 
-To compile Chez Scheme for a target platform that is different than
+To compile Chez Scheme for a target platform that is different from
 the host platform, supply the `--cross` flag to the "configure" script
 while also specifying the target machine type, compiler settings to
 build for the target platform, and `CC_FOR_BUILD=<compiler>` to
@@ -568,7 +606,8 @@ To cross compile for iOS, provide an iOS SDK path and define the
  ./configure \
    --cross \
    -m=tarm64ios \
-   CFLAGS="-arch arm64 -isysroot $(xcrun -sdk iphoneos --show-sdk-path) -DTARGET_OS_IPHONE -DDISABLE_CURSES -liconv" \
+   CFLAGS="-arch arm64 -isysroot $(xcrun -sdk iphoneos --show-sdk-path) -DTARGET_OS_IPHONE=1 -DDISABLE_CURSES" \
+   LDFLAGS="-liconv" \
    CC_FOR_BUILD=clang
  make
 
@@ -590,7 +629,7 @@ After `make` to build, use `make install` to gather cross-compiled
 components. Typically, `--temproot=<dir>` should be supplied as a
 configure argument along with `--cross`, in which case the
 installation is placed in a <dir> to be moved to the target platform.
-Alternatively, a destination directory be selected at the installation
+Alternatively, a destination directory can be selected at the installation
 step via `DESTDIR`:
 
  make install DESTDIR=/tmp/staging
@@ -598,7 +637,7 @@ step via `DESTDIR`:
 
 CROSS COMPILING SCHEME PROGRAMS
 
-After a non-cross build to work on the host platform, using
+After getting a non-cross build to work on the host platform, using
 
   make bootquick XM=<machine type>
 
@@ -606,8 +645,8 @@ or
 
   zuo . bootquick <machine type>
 
-creates a "boot" subdirectory for <machine type> containing boot file,
-and in the process create a cross-compilation patch file as
+creates a "boot" subdirectory for <machine type> containing boot files
+and in the process creates a cross-compilation patch file as
 "xc-<machine type>/s/xpatch". Loading that "xpatch" file into Chez
 Scheme for the current platform changes functions like `compile-file`
 and `make-boot-file` to generate code for the target <machine type>.

@@ -245,7 +245,12 @@
                     ;; offset not aligned or out of range
                     (let ([u (make-tmp 'umov)])
                       (seq
-                       (build-set! ,u (asm ,null-info ,(asm-add #f) ,x0 (immediate ,imm)))
+                       (if (funky12 imm)
+                           (build-set! ,u (asm ,null-info ,(asm-add #f) ,x0 (immediate ,imm)))
+                           (let ([tmp (make-tmp 'tmp)])
+                             (seq
+                              (build-set! ,tmp (immediate ,imm))
+                              (build-set! ,u (asm ,null-info ,(asm-add #f) ,x0 ,tmp)))))
                        (if (eq? x1 %zero)
                            (return u %zero 0)
                            (seq
@@ -676,6 +681,15 @@
          `(set! ,(make-live-info) ,ulr (asm ,null-info ,asm-kill))
          `(asm ,info ,asm-unactivate-thread ,x ,u ,ulr)))])
 
+  (define-instruction value save-errno
+    [(op (z ur))
+     (safe-assert (eq? z %Cretval))
+     (let ([u (make-tmp 'u)] [ulr (make-precolored-unspillable 'ulr %lr)])
+       (seq
+         `(set! ,(make-live-info) ,u (asm ,null-info ,asm-kill))
+         `(set! ,(make-live-info) ,ulr (asm ,null-info ,asm-kill))
+         `(set! ,(make-live-info) ,z (asm ,info ,asm-save-errno ,u ,ulr))))])
+
   (define-instruction value (asmlibcall)
     [(op (z ur))
      (let ([u (make-tmp 'u)])
@@ -868,6 +882,7 @@
                      ; threaded version specific
                      asm-get-tc
                      asm-activate-thread asm-deactivate-thread asm-unactivate-thread
+                     asm-save-errno
                      ; machine dependent exports
                      asm-kill
                      info-vpush-reg info-vpush-n)
@@ -2195,6 +2210,11 @@
       (lambda (code* arg-reg jmp-tmp . ignore)
         (asm-helper-call code* target #f jmp-tmp))))
 
+  (define asm-save-errno
+    (let ([target `(arm32-call 0 (entry ,(lookup-c-entry save-errno)))])
+      (lambda (code* dest jmp-tmp . ignore)
+        (asm-helper-call code* target #f jmp-tmp))))
+
   (define-who asm-return-address
     (lambda (dest l incr-offset next-addr)
       (make-rachunk dest l incr-offset next-addr
@@ -2394,16 +2414,27 @@
                                     (fx= (cadr m) 8)))
     (define (float-member? m) (and (eq? (car m) 'float)
                                    (fx= (cadr m) 4)))
-    (define (indirect-result-that-fits-in-registers? result-type)
+    (define filter-union
+      (lambda (members)
+        ;; remove members of an `&`-wrapped ftd that have the
+        ;; same the same type and offset; this has the effect of
+        ;; counting elements correctly for homogenous aggregates
+        (let loop ([members members])
+          (cond
+            [(null? members) '()]
+            [(member (car members) (cdr members)) (loop (cdr members))]
+            [else (cons (car members) (loop (cdr members)))]))))
+    (define (indirect-result-that-fits-in-registers? result-type basestd?)
       (nanopass-case (Ltype Type) result-type
-        [(fp-ftd& ,ftd)
-         (let* ([members ($ftd->members ftd)]
+        [(fp-ftd& ,ftd ,fptd)
+         (let* ([members (filter-union ($ftd->members ftd))]
                 [num-members (length members)])
            (or (fx<= ($ftd-size ftd) 4)
                (and (fx= num-members 1)
                     ;; a struct containing only int64 is not returned in a register
                     (or (not ($ftd-compound? ftd))))
-               (and (fx<= num-members 4)
+               (and (not basestd?)
+                    (fx<= num-members 4)
                     (or (andmap double-member? members)
                         (andmap float-member? members)))))]
         [else #f]))
@@ -2434,7 +2465,8 @@
                      (cond
                       [(null? fp-regs) e]
                       [else
-                       (let ([info (make-info-vpush (car fp-regs) (length fp-regs))])
+                       ;; assuming that fp registers will be contiguous starting from `%Cfparg1`
+                       (let ([info (make-info-vpush %Cfparg1 (length fp-regs))])
                          (%seq
                           (inline ,info ,%vpush-multiple)
                           ,e
@@ -2548,16 +2580,16 @@
                        (set! ,loreg ,(%mref ,x ,from-offset))
                        (set! ,hireg ,(%mref ,x ,(fx+ from-offset 4))))))]
                  [do-args
-                  (lambda (types varargs?)
+                  (lambda (types basestd?)
                     ; sgl* is always of even-length, i.e., has a sgl/dbl reg first
                     ; bsgl is set to "b" single (second half of double) if we have one to fill
-                    (let loop ([types types] [locs '()] [live* '()] [int* (int-regs)] [sgl* (if varargs? '() (sgl-regs))] [bsgl #f] [isp 0])
+                    (let loop ([types types] [locs '()] [live* '()] [int* (int-regs)] [sgl* (if basestd? '() (sgl-regs))] [bsgl #f] [isp 0])
                       (if (null? types)
                           (values isp locs live*)
                           (nanopass-case (Ltype Type) (car types)
                             [(fp-double-float)
                              (cond
-                              [(and varargs?
+                              [(and basestd?
                                     ;; For varargs, treat a double like a 64-bit integer
                                     (let ([int* (if (even? (length int*)) int* (cdr int*))])
                                       (and (pair? int*)
@@ -2574,7 +2606,7 @@
                               [else
                                (loop (cdr types)
                                      (cons (load-double-reg (car sgl*)) locs)
-                            (cons (car sgl*) live*) int* (cddr sgl*) bsgl isp)])]
+                                     (cons (car sgl*) live*) int* (cddr sgl*) bsgl isp)])]
                             [(fp-single-float)
                              (cond
                               [bsgl
@@ -2582,11 +2614,11 @@
                                      (cons (load-single-reg bsgl #f) locs)
                                      (cons bsgl live*) int* sgl* #f isp)]
                               [(and (not (null? sgl*))
-                                    (not varargs?))
+                                    (not basestd?))
                                (loop (cdr types)
                                      (cons (load-single-reg (car sgl*) #f) locs)
                                      (cons (car sgl*) live*) int* (cddr sgl*) (cadr sgl*) isp)]
-                              [(and varargs?
+                              [(and basestd?
                                     (not (null? int*)))
                                (loop (cdr types)
                                      (cons (load-single-int-reg (car int*)) locs)
@@ -2595,9 +2627,9 @@
                                (loop (cdr types)
                                      (cons (load-single-stack isp) locs)
                                      live* int* '() #f (fx+ isp 4))])]
-                            [(fp-ftd& ,ftd)
+                            [(fp-ftd& ,ftd ,fptd)
                              (let ([size ($ftd-size ftd)]
-                                   [members ($ftd->members ftd)]
+                                   [members (filter-union ($ftd->members ftd))]
                                    [combine-loc (lambda (loc f)
                                                   (if loc
                                                       (lambda (x) (%seq ,(loc x) ,(f x)))
@@ -2606,7 +2638,7 @@
                                  [(8)
                                   (let* ([int* (if (even? (length int*)) int* (cdr int*))]
                                          [num-members (length members)]
-                                         [doubles? (and (not varargs?)
+                                         [doubles? (and (not basestd?)
                                                         (fx<= num-members 4)
                                                         (andmap double-member? members))])
                                     ;; Sequence of up to 4 doubles that fits in registers?
@@ -2640,13 +2672,13 @@
                                                         (cons* (car int*) (cadr int*) live*) (cddr int*) isp))]))]))]
                                  [else
                                   (let* ([num-members (length members)]
-                                         [floats? (and (not varargs?)
+                                         [floats? (and (not basestd?)
                                                        (fx<= num-members 4)
                                                        (andmap float-member? members))])
                                     ;; Sequence of up to 4 floats that fits in registers?
                                     (cond
                                      [(and floats?
-                                           (not varargs?)
+                                           (not basestd?)
                                            (fx>= (fx+ (length sgl*) (if bsgl 1 0)) num-members))
                                       ;; Allocate each float to register
                                       (let flt-loop ([size size] [offset 0] [sgl* sgl*] [bsgl bsgl] [loc #f] [live* live*])
@@ -2697,18 +2729,19 @@
                                            (cons (load-int-reg (car int*)) locs)
                                            (cons (car int*) live*) (cdr int*) sgl* bsgl isp)))]))))]
                  [add-fill-result
-                  (lambda (fill-result-here? result-type args-frame-size e)
+                  (lambda (fill-result-here? result-type args-frame-size basestd? e)
                     (cond
                      [fill-result-here?
                       (nanopass-case (Ltype Type) result-type
-                        [(fp-ftd& ,ftd)
-                         (let* ([members ($ftd->members ftd)]
+                        [(fp-ftd& ,ftd ,fptd)
+                         (let* ([members (filter-union ($ftd->members ftd))]
                                 [num-members (length members)]
                                 ;; result pointer is stashed on the stack after all arguments:
                                 [dest-x %r2]
                                 [init-dest-e `(seq ,e (set! ,dest-x ,(%mref ,%sp ,args-frame-size)))])
                            (cond
-                            [(and (fx<= num-members 4)
+                            [(and (not basestd?)
+                                  (fx<= num-members 4)
                                   (or (andmap double-member? members)
                                       (andmap float-member? members)))
                              ;; double/float results are in floating-point registers
@@ -2742,14 +2775,14 @@
                                          (set! ,(%mref ,dest-x ,4) ,%r1))]))]))])]
                      [else e]))]
                  [get-result-regs
-                  (lambda (result-type varargs?)
+                  (lambda (result-type basestd?)
                     (nanopass-case (Ltype Type) result-type
                       [(fp-double-float)
-                       (if varargs?
+                       (if basestd?
                            (list %r1 %Cretval)
                            (list %Cfpretval))]
                       [(fp-single-float)
-                       (if varargs?
+                       (if basestd?
                            (list %Cretval)
                            (list %Cfpretval))]
                       [(fp-integer ,bits)
@@ -2760,11 +2793,12 @@
                        (case bits
                          [(64) (list %r1 %Cretval)]
                          [else (list %Cretval)])]
-                      [(fp-ftd& ,ftd)
-                       (let* ([members ($ftd->members ftd)]
+                      [(fp-ftd& ,ftd ,fptd)
+                       (let* ([members (filter-union ($ftd->members ftd))]
                               [num-members (length members)])
                          (cond
-                          [(and (fx<= num-members 4)
+                          [(and (not basestd?)
+                                (fx<= num-members 4)
                                 (or (andmap double-member? members)
                                     (andmap float-member? members)))
                            ;; double/float results are in floating-point registers
@@ -2784,27 +2818,42 @@
                              [(8) (list %Cretval %r1)]
                              [else (list %Cretval)])]))]
                       [else (list %r0)]))]
-                 [add-deactivate
-                  (lambda (adjust-active? t0 live* result-live* k)
+                 [add-deactivate/errno
+                  (lambda (adjust-active? maybe-errno-lvalue t0 live* result-live* k)
                     (cond
                      [adjust-active?
                       (%seq
                        (set! ,%ac0 ,t0)
                        ,(save-and-restore live* (%inline deactivate-thread))
                        ,(k %ac0)
-                       ,(save-and-restore result-live* `(set! ,%Cretval ,(%inline activate-thread))))]
+                       ,(save-and-restore result-live* (let ([e `(set! ,%Cretval ,(%inline activate-thread))])
+                                                         (cond
+                                                           [maybe-errno-lvalue
+                                                            (%seq
+                                                             (set! ,%Cretval ,(%inline save-errno))
+                                                             ,(save-and-restore (list %Cretval) e)
+                                                             (set! ,maybe-errno-lvalue ,%Cretval))]
+                                                           [else
+                                                            e]))))]
+                     [maybe-errno-lvalue
+                      (%seq
+                       ,(k t0)
+                       ,(save-and-restore result-live* (%seq
+                                                        (set! ,%Cretval ,(%inline save-errno))
+                                                        (set! ,maybe-errno-lvalue ,%Cretval))))]
                      [else (k t0)]))])
           (lambda (info)
             (safe-assert (reg-callee-save? %tc)) ; no need to save-restore
             (let* ([arg-type* (info-foreign-arg-type* info)]
                    [conv* (info-foreign-conv* info)]
-                   [varargs? (ormap (lambda (conv) (and (pair? conv) (eq? (car conv) 'varargs))) conv*)]
+                   [basestd? (or (constant arm-softfp)
+                                 (ormap (lambda (conv) (and (pair? conv) (eq? (car conv) 'varargs))) conv*))]
                    [result-type (info-foreign-result-type info)]
-                   [result-reg* (get-result-regs result-type varargs?)]
-                   [fill-result-here? (indirect-result-that-fits-in-registers? result-type)]
+                   [result-reg* (get-result-regs result-type basestd?)]
+                   [fill-result-here? (indirect-result-that-fits-in-registers? result-type basestd?)]
                    [adjust-active? (if-feature pthreads (memq 'adjust-active conv*) #f)])
               (with-values (do-args (if fill-result-here? (cdr arg-type*) arg-type*)
-                                    varargs?)
+                                    basestd?)
                 (lambda (args-frame-size locs live*)
                   (let* ([frame-size (align 8 (+ args-frame-size
                                                  (if fill-result-here?
@@ -2823,20 +2872,21 @@
                          ;; stash extra argument on the stack to be retrieved after call and filled with the result:
                          (cons (load-int-stack args-frame-size) locs)]
                         [else locs]))
-                     (lambda (t0 not-varargs?)
-                       (add-fill-result fill-result-here? result-type args-frame-size
-                                        (add-deactivate adjust-active? t0 live* result-reg*
-                                                        (lambda (t0)
-                                                          `(inline ,(make-info-kill*-live* (add-caller-save-registers result-reg*) live*) ,%c-call ,t0)))))
+                     (lambda (t0 atomic? maybe-errno-lvalue)
+                       (add-fill-result fill-result-here? result-type args-frame-size basestd?
+                                        (add-deactivate/errno
+                                         adjust-active? maybe-errno-lvalue t0 live* result-reg*
+                                         (lambda (t0)
+                                           `(inline ,(make-info-kill*-live* (add-caller-save-registers result-reg*) live*) ,%c-call ,t0)))))
                      (nanopass-case (Ltype Type) result-type
                        [(fp-double-float)
-                        (if varargs?
+                        (if basestd?
                             (lambda (lvalue) ; unboxed
                               `(set! ,lvalue ,(%inline fpcastfrom ,%r1 ,%Cretval)))
                             (lambda (lvalue) ; unboxed
                               `(set! ,lvalue ,%Cfpretval)))]
                        [(fp-single-float)
-                        (if varargs?
+                        (if basestd?
                             (lambda (lvalue) ; unboxed
                               (let ([t %Cfpretval]) ; should be ok as a temporary register
                                 `(seq
@@ -2944,34 +2994,34 @@
               (lambda (lvalue)
                 `(set! ,lvalue ,(%inline + ,%sp (immediate ,offset))))))
           (define count-reg-args
-            (lambda (types synthesize-first? varargs?)
+            (lambda (types synthesize-first? basestd?)
                     ; bsgl? is #t iff we have a "b" single (second half of double) float reg to fill
               (let f ([types types] [iint (if synthesize-first? -1 0)] [idbl 0] [bsgl? #f])
                 (if (null? types)
                     (values iint idbl)
                     (nanopass-case (Ltype Type) (car types)
                       [(fp-double-float)
-                       (if varargs?
+                       (if basestd?
                            (let ([iint (align 2 iint)])
                              (f (cdr types) (if (fx< iint num-int-regs) (fx+ iint 2) iint) idbl bsgl?))
                            (if (fx< idbl 8)
                                (f (cdr types) iint (fx+ idbl 1) bsgl?)
                                (f (cdr types) iint idbl #f)))]
                       [(fp-single-float)
-                       (if varargs?
+                       (if basestd?
                            (f (cdr types) (if (fx< iint num-int-regs) (fx+ iint 1) iint) idbl bsgl?)
                            (if bsgl?
                                (f (cdr types) iint idbl #f)
                                (if (fx< idbl 8)
                                    (f (cdr types) iint (fx+ idbl 1) #t)
                                    (f (cdr types) iint idbl #f))))]
-                      [(fp-ftd& ,ftd)
+                      [(fp-ftd& ,ftd ,fptd)
                        (let* ([size ($ftd-size ftd)]
-                              [members ($ftd->members ftd)]
+                              [members (filter-union ($ftd->members ftd))]
                               [num-members (length members)])
                          (cond
                           [(and (fx<= num-members 4)
-                                (not varargs?)
+                                (not basestd?)
                                 (andmap double-member? members))
                            ;; doubles are either in registers or all on stack
                            (if (fx<= (fx+ idbl num-members) 8)
@@ -2979,7 +3029,7 @@
                                ;; no more floating-point registers should be used, but ok if we count more
                                (f (cdr types) iint idbl #f))]
                           [(and (fx<= num-members 4)
-                                (not varargs?)
+                                (not basestd?)
                                 (andmap float-member? members))
                            ;; floats are either in registers or all on stack
                            (let ([amt (fxsrl (align 2 (fx- num-members (if bsgl? 1 0))) 1)])
@@ -3010,10 +3060,10 @@
             ; continue on into the stack variables, which is convenient when a struct
             ; argument is split across registers and the stack
             (lambda (types saved-reg-bytes pre-pad-bytes return-bytes float-reg-bytes post-pad-bytes int-reg-bytes
-                           synthesize-first? varargs?)
+                           synthesize-first? basestd?)
               (let* ([return-space-offset (fx+ saved-reg-bytes pre-pad-bytes)]
-                     [float-reg-offset (fx+ return-space-offset return-bytes)]
-                     [int-reg-offset (fx+ float-reg-offset float-reg-bytes post-pad-bytes)]
+                     [float-reg-offset (fx+ return-space-offset)]
+                     [int-reg-offset (fx+ float-reg-offset float-reg-bytes return-bytes post-pad-bytes)]
                      [stack-arg-offset (fx+ int-reg-offset int-reg-bytes)])
                 (let loop ([types (if synthesize-first? (cdr types) types)]
                            [locs '()]
@@ -3032,7 +3082,7 @@
                       (nanopass-case (Ltype Type) (car types)
                         [(fp-double-float)
                          (cond
-                          [(and varargs?
+                          [(and basestd?
                                 ;; For varargs, treat a double like a 64-bit integer
                                 (let ([iint (align 2 iint)])
                                   (and (fx< iint num-int-regs)
@@ -3043,14 +3093,14 @@
                                   (loop (cdr types)
                                         (cons (load-double-stack int-reg-offset) locs)
                                         (fx+ iint 2) idbl bsgl-offset (fx+ int-reg-offset 8) float-reg-offset stack-arg-offset)))]
-                          [(and (not varargs?)
+                          [(and (not basestd?)
                                 (< idbl num-dbl-regs))
                            (loop (cdr types)
                                  (cons (load-double-stack float-reg-offset) locs)
                                  iint (fx+ idbl 1) bsgl-offset int-reg-offset (fx+ float-reg-offset 8) stack-arg-offset)]
                           [else
                            (let ([stack-arg-offset (align 8 stack-arg-offset)]
-                                 [iint (if varargs? (align 2 iint) iint)]) ; use up register if argument didn't fit
+                                 [iint (if basestd? (align 2 iint) iint)]) ; use up register if argument didn't fit
                              (loop (cdr types)
                                    (cons (load-double-stack stack-arg-offset) locs)
                                    iint num-dbl-regs #f int-reg-offset float-reg-offset (fx+ stack-arg-offset 8)))])]
@@ -3061,13 +3111,13 @@
                                  (cons (load-single-stack bsgl-offset) locs)
                                  iint idbl #f int-reg-offset float-reg-offset stack-arg-offset)]
                           [(and (< idbl num-dbl-regs)
-                                (not varargs?))
+                                (not basestd?))
                            (loop (cdr types)
                                  ; with big-endian ARM might need to adjust offset +/- 4 since pair of
                                  ; single floats in a pushed double float might be reversed
                                  (cons (load-single-stack float-reg-offset) locs)
                                  iint (fx+ idbl 1) (fx+ float-reg-offset 4) int-reg-offset (fx+ float-reg-offset 8) stack-arg-offset)]
-                          [(and varargs?
+                          [(and basestd?
                                 (fx< iint num-int-regs))
                            (loop (cdr types)
                                  (cons (load-single-stack int-reg-offset) locs)
@@ -3076,12 +3126,12 @@
                            (loop (cdr types)
                                  (cons (load-single-stack stack-arg-offset) locs)
                                  iint num-dbl-regs #f int-reg-offset float-reg-offset (fx+ stack-arg-offset 4))])]
-                        [(fp-ftd& ,ftd)
+                        [(fp-ftd& ,ftd ,fptd)
                          (let* ([size ($ftd-size ftd)]
-                                [members ($ftd->members ftd)]
+                                [members (filter-union ($ftd->members ftd))]
                                 [num-members (length members)])
                            (cond
-                            [(and (not varargs?)
+                            [(and (not basestd?)
                                   (fx<= num-members 4)
                                   (andmap double-member? members))
                              ;; doubles are either in registers or all on stack
@@ -3093,7 +3143,7 @@
                                    (loop (cdr types)
                                          (cons (load-stack-address stack-arg-offset) locs)
                                          iint num-dbl-regs #f int-reg-offset #f (fx+ stack-arg-offset size))))]
-                            [(and (not varargs?)
+                            [(and (not basestd?)
                                   (fx<= num-members 4)
                                   (andmap float-member? members))
                              ;; floats are either in registers or all on stack
@@ -3161,13 +3211,13 @@
                                        (cons (load-int-stack (car types) int-reg-offset) locs)
                                        (fx+ iint 1) idbl bsgl-offset (fx+ int-reg-offset 4) float-reg-offset stack-arg-offset)))]))))))
           (define do-result
-            (lambda (result-type synthesize-first? varargs? return-stack-offset)
+            (lambda (result-type synthesize-first? basestd? return-stack-offset)
               (nanopass-case (Ltype Type) result-type
-                [(fp-ftd& ,ftd)
-                 (let* ([members ($ftd->members ftd)]
+                [(fp-ftd& ,ftd ,fptd)
+                 (let* ([members (filter-union ($ftd->members ftd))]
                         [num-members (length members)])
                    (cond
-                    [(and (not varargs?)
+                    [(and (not basestd?)
                           (fx<= 1 num-members 4)
                           (or (andmap double-member? members)
                               (andmap float-member? members)))
@@ -3218,7 +3268,7 @@
                                 (list %Cretval)
                                 4)])]))]
                 [(fp-double-float)
-                 (values (if varargs?
+                 (values (if basestd?
                              (lambda (rhs)
                                (let-values ([(endreg otherreg) (constant-case native-endianness
                                                                               [(little) (values %Cretval %r1)]
@@ -3228,19 +3278,19 @@
                                    (set! ,otherreg ,(%mref ,rhs ,(fx+ 4 (constant flonum-data-disp)))))))
                              (lambda (rhs)
                                `(set! ,%Cfpretval ,(%mref ,rhs ,%zero ,(constant flonum-data-disp) fp))))
-                         (if varargs?
+                         (if basestd?
                              (list %Cretval %r1)
                              (list %Cfpretval))
                          0)]
                 [(fp-single-float)
-                 (values (if varargs?
+                 (values (if basestd?
                              (lambda (rhs)
                                `(seq
                                  (set! ,%Cfpretval ,(%inline double->single ,(%mref ,rhs ,%zero ,(constant flonum-data-disp) fp)))
                                  (set! ,%Cretval ,(%inline fpcastto/lo ,%Cfpretval))))
                              (lambda (rhs)
                                `(set! ,%Cfpretval ,(%inline double->single ,(%mref ,rhs ,%zero ,(constant flonum-data-disp) fp)))))
-                         (if varargs?
+                         (if basestd?
                              (list %Cretval)
                              (list %Cfpretval))
                          0)]
@@ -3278,11 +3328,12 @@
                                  (vector->list regvec)))
             (let* ([arg-type* (info-foreign-arg-type* info)]
                    [conv* (info-foreign-conv* info)]
-                   [varargs? (ormap (lambda (conv) (and (pair? conv) (eq? (car conv) 'varargs))) conv*)]
+                   [basestd? (or (constant arm-softfp)
+                                 (ormap (lambda (conv) (and (pair? conv) (eq? (car conv) 'varargs))) conv*))]
                    [result-type (info-foreign-result-type info)]
-                   [synthesize-first? (indirect-result-that-fits-in-registers? result-type)]
+                   [synthesize-first? (indirect-result-that-fits-in-registers? result-type basestd?)]
                    [adjust-active? (if-feature pthreads (memq 'adjust-active conv*) #f)])
-              (let-values ([(iint idbl) (count-reg-args arg-type* synthesize-first? varargs?)])
+              (let-values ([(iint idbl) (count-reg-args arg-type* synthesize-first? basestd?)])
                 (let ([saved-reg-bytes (fx+ (fx* isaved 4) (fx* fpsaved 8))]
                       [pre-pad-bytes (if (fxeven? isaved)
                                          (if adjust-active? 8 0)
@@ -3291,7 +3342,7 @@
                       [post-pad-bytes (if (fxeven? iint) 0 4)]
                       [float-reg-bytes (fx* idbl 8)])
                   (let-values ([(get-result result-regs return-bytes)
-                                (do-result result-type synthesize-first? varargs?
+                                (do-result result-type synthesize-first? basestd?
                                            (fx+ saved-reg-bytes pre-pad-bytes))])
                     (let ([return-bytes (align 8 return-bytes)])
                       (values
@@ -3324,7 +3375,7 @@
                        ; list of procedures that marshal arguments from their C stack locations
                        ; to the Scheme argument locations
                        (do-stack arg-type* saved-reg-bytes pre-pad-bytes return-bytes float-reg-bytes post-pad-bytes int-reg-bytes
-                                 synthesize-first? varargs?)
+                                 synthesize-first? basestd?)
                        get-result
                        (lambda ()
                          (in-context Tail

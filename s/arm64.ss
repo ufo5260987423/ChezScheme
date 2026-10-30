@@ -5,7 +5,8 @@
 ;;;  Register usage:
 ;;;   r0-r7: C argument/result registers, caller-save
 ;;;   r8: indirect-result register, caller-save
-;;;   r9-18: caller-save
+;;;   r9-17: caller-save
+;;;   r18: Reserved platform register. Used on macOS and Window. Free on Linux.
 ;;;   r19-28: callee-save
 ;;;   r29: frame pointer, callee-save
 ;;;   r30: a.k.a. lr, link register
@@ -534,6 +535,22 @@
          `(set! ,(make-live-info) ,ulr (asm ,null-info ,asm-kill))
          `(asm ,info ,asm-unactivate-thread ,x ,ulr)))])
 
+  (define-instruction value save-errno
+    [(op (z ur))
+     (safe-assert (eq? z %Cretval))
+     (let ([ulr (make-precolored-unspillable 'ulr %lr)])
+       (seq
+         `(set! ,(make-live-info) ,ulr (asm ,null-info ,asm-kill))
+         `(set! ,(make-live-info) ,z (asm ,info ,asm-save-errno ,ulr))))])
+
+  (define-instruction value save-last-error
+    [(op (z ur))
+     (safe-assert (eq? z %Cretval))
+     (let ([ulr (make-precolored-unspillable 'ulr %lr)])
+       (seq
+         `(set! ,(make-live-info) ,ulr (asm ,null-info ,asm-kill))
+         `(set! ,(make-live-info) ,z (asm ,info ,asm-save-last-error ,ulr))))])
+
   (define-instruction value (asmlibcall)
     [(op (z ur))
      (if (info-asmlib-save-ra? info)
@@ -724,6 +741,7 @@
                      ; threaded version specific
                      asm-get-tc
                      asm-activate-thread asm-deactivate-thread asm-unactivate-thread
+                     asm-save-errno asm-save-last-error
                      ; machine dependent exports
                      asm-kill)
 
@@ -2170,7 +2188,7 @@
 
   (define asm-activate-thread
     (let ([target `(arm64-call 0 (entry ,(lookup-c-entry activate-thread)))])
-      (lambda (code* dest . ignore)
+      (lambda (code* dest . ignore) ; dest is Cretval
         (asm-helper-call code* target #t))))
 
   (define asm-deactivate-thread
@@ -2181,6 +2199,16 @@
   (define asm-unactivate-thread
     (let ([target `(arm64-call 0 (entry ,(lookup-c-entry unactivate-thread)))])
       (lambda (code* arg-reg . ignore)
+        (asm-helper-call code* target #f))))
+
+  (define asm-save-errno
+    (let ([target `(arm64-call 0 (entry ,(lookup-c-entry save-errno)))])
+      (lambda (code* dest . ignore) ; dest is Cretval
+        (asm-helper-call code* target #f))))
+
+  (define asm-save-last-error
+    (let ([target `(arm64-call 0 (entry ,(lookup-c-entry save-last-error)))])
+      (lambda (code* dest . ignore) ; dest is Cretval
         (asm-helper-call code* target #f))))
 
   (define-who asm-return-address
@@ -2405,7 +2433,7 @@
                                    (fx= (cadr m) 4)))
     (define (indirect-result-that-fits-in-registers? result-type)
       (nanopass-case (Ltype Type) result-type
-        [(fp-ftd& ,ftd)
+        [(fp-ftd& ,ftd ,fptd)
          (let* ([members ($ftd->members ftd)]
                 [num-members (length members)])
            (or (fx<= ($ftd-size ftd) 4)
@@ -2478,9 +2506,10 @@
                                                (= stack-align (align 8 stack-align)))
                                                4
                                                8)]
-                                              [(fp-ftd& ,ftd) (cond
-                                                                [(> ($ftd-size ftd) 16) 8]
-                                                                [else ($ftd-alignment ftd)])]
+                                              [(fp-ftd& ,ftd ,fptd)
+                                               (cond
+                                                 [(> ($ftd-size ftd) 16) 8]
+                                                 [else ($ftd-alignment ftd)])]
                                               [(fp-integer ,bits) (fxquotient bits 8)]
                                               [(fp-unsigned ,bits) (fxquotient bits 8)]
                                               [else 8])])])
@@ -2513,19 +2542,20 @@
                        (nanopass-case (Ltype Type) (car types)
                          [(fp-double-float) (use-fp-regs 1)]
                          [(fp-single-float) (use-fp-regs 1)]
-                         [(fp-ftd& ,ftd) (cond
-                                           [(> ($ftd-size ftd) 16) (next-is-stack types)]
-                                           [else
-                                            (let ([members ($ftd->members ftd)])
-                                              (cond
-                                                [(and (fx= 8 ($ftd-alignment ftd))
-                                                      (andmap double-member? members))
-                                                 (use-fp-regs (length members))]
-                                                [(and (fx= 4 ($ftd-alignment ftd))
-                                                      (andmap float-member? members))
-                                                 (use-fp-regs (length members))]
-                                                [else
-                                                 (use-int-regs (fxquotient (align ($ftd-size ftd) 8) 8))]))])]
+                         [(fp-ftd& ,ftd ,fptd)
+                          (cond
+                            [(> ($ftd-size ftd) 16) (next-is-stack types)]
+                            [else
+                             (let ([members ($ftd->members ftd)])
+                               (cond
+                                 [(and (fx= 8 ($ftd-alignment ftd))
+                                       (andmap double-member? members))
+                                  (use-fp-regs (length members))]
+                                 [(and (fx= 4 ($ftd-alignment ftd))
+                                       (andmap float-member? members))
+                                  (use-fp-regs (length members))]
+                                 [else
+                                  (use-int-regs (fxquotient (align ($ftd-size ftd) 8) 8))]))])]
                          [else (use-int-regs 1)]))])))])]
           [else
            (k (align 8 size) 0 0)])))
@@ -2599,7 +2629,7 @@
                             (loop (cdr types) (rest-of int* 0 next-varargs-after)(rest-of fp* 1 next-varargs-after)
                                   next-varargs-after
                                   stack-align))])]
-                  [(fp-ftd& ,ftd)
+                  [(fp-ftd& ,ftd ,fptd)
                    (let* ([size ($ftd-size ftd)]
                           [members (filter-union ($ftd->members ftd))]
                           [num-members (length members)]
@@ -2820,7 +2850,7 @@
                                   (loop types cats
                                         (cons (load-single-stack isp) locs)
                                         (fx+ isp (cat-size cat) (cat-pad cat)) ind-sp)])]
-                              [(fp-ftd& ,ftd)
+                              [(fp-ftd& ,ftd ,fptd)
                                (let ([size ($ftd-size ftd)])
                                  (case (cat-place cat)
                                    [(int)
@@ -2903,7 +2933,7 @@
                   ;; may destroy the values in result registers
                   (lambda (result-cat result-type args-frame-size fill-result-here? e)
                     (nanopass-case (Ltype Type) result-type
-                      [(fp-ftd& ,ftd)
+                      [(fp-ftd& ,ftd ,fptd)
                        (let* ([size ($ftd-size ftd)]
                               [tmp %argtmp])
                          (case (and fill-result-here?
@@ -2934,22 +2964,40 @@
                       [else
                        ;; anything else
                        e]))]
-                 [add-deactivate
-                  (lambda (adjust-active? t0 live* result-live* k)
+                 [add-deactivate/errno
+                  (lambda (adjust-active? save-last-error? maybe-errno-lvalue t0 live* result-live* k)
                     (cond
-                     [adjust-active?
-                      (%seq
-                       (set! ,%ac0 ,t0)
-                       ,(save-and-restore live* (%inline deactivate-thread))
-                       ,(k %ac0)
-                       ,(save-and-restore result-live* `(set! ,%Cretval ,(%inline activate-thread))))]
-                     [else (k t0)]))])
+                      [adjust-active?
+                       (%seq
+                        (set! ,%ac0 ,t0)
+                        ,(save-and-restore live* (%inline deactivate-thread))
+                        ,(k %ac0)
+                        ,(save-and-restore result-live* (let ([e `(set! ,%Cretval ,(%inline activate-thread))])
+                                                          (cond
+                                                            [maybe-errno-lvalue
+                                                             (%seq
+                                                              (set! ,%Cretval ,(if save-last-error?
+                                                                                   (%inline save-last-error)
+                                                                                   (%inline save-errno)))
+                                                              ,(save-and-restore (list %Cretval) e)
+                                                              (set! ,maybe-errno-lvalue ,%Cretval))]
+                                                            [else e]))))]
+                      [maybe-errno-lvalue
+                       (%seq
+                        ,(k t0)
+                        ,(save-and-restore result-live*
+                                           (%seq
+                                            (set! ,%Cretval ,(if save-last-error?
+                                                                 (%inline save-last-error)
+                                                                 (%inline save-errno)))
+                                            (set! ,maybe-errno-lvalue ,%Cretval))))]
+                      [else (k t0)]))])
           (lambda (info)
             (safe-assert (reg-callee-save? %tc)) ; no need to save-restore
             (let* ([arg-type* (info-foreign-arg-type* info)]
                    [result-type (info-foreign-result-type info)]
                    [ftd-result? (nanopass-case (Ltype Type) result-type
-                                  [(fp-ftd& ,ftd) #t]
+                                  [(fp-ftd& ,ftd ,fptd) #t]
                                   [else #f])]
                    [arg-type* (if ftd-result?
                                   (cdr arg-type*)
@@ -2964,6 +3012,7 @@
                    [arg-stack-bytes (align 16 (compute-stack-argument-space arg-cat*))]
                    [indirect-stack-bytes (align 16 (compute-stack-indirect-space arg-cat*))]
                    [adjust-active? (if-feature pthreads (memq 'adjust-active conv*) #f)]
+                   [save-last-error? (if-feature windows (memq 'save-last-error conv*) #f)]
                    [locs (do-args arg-type* arg-cat* arg-stack-bytes)]
                    [live* (get-registers arg-cat* 'all)]
                    [live* (if (and ftd-result? (not fill-result-here?))
@@ -2990,11 +3039,13 @@
                    ;; callee expects pointer to fill for return in %r8:
                    (cons (lambda (rhs) `(set! ,%r8 ,rhs)) locs)]
                   [else locs]))
-               (lambda (t0 not-varargs?)
+               (lambda (t0 not-varargs? maybe-errno-lvalue)
                  (add-fill-result result-cat result-type (fx+ arg-stack-bytes indirect-stack-bytes) fill-result-here?
-                                  (add-deactivate adjust-active? t0 live* result-reg*
-                                                  (lambda (t0)
-                                                    `(inline ,(make-info-kill*-live* (add-caller-save-registers result-reg*) live*) ,%c-call ,t0)))))
+                                  (add-deactivate/errno
+                                   adjust-active? save-last-error? maybe-errno-lvalue
+                                   t0 live* result-reg*
+                                   (lambda (t0)
+                                     `(inline ,(make-info-kill*-live* (add-caller-save-registers result-reg*) live*) ,%c-call ,t0)))))
                (nanopass-case (Ltype Type) result-type
                  [(fp-double-float)
                   (lambda (lvalue) ; unboxed
@@ -3141,7 +3192,7 @@
                             (loop types cats
                                   (cons (load-single-stack stack-arg-offset) locs)
                                   int-reg-offset float-reg-offset (fx+ stack-arg-offset (cat-size cat) (cat-pad cat)))])]
-                        [(fp-ftd& ,ftd)
+                        [(fp-ftd& ,ftd ,fptd)
                          (case (cat-place cat)
                            [(int)
                             (let ([indirect-bytes (cat-indirect-bytes cat)])
@@ -3220,7 +3271,7 @@
                    `(set! ,%Cfpretval ,(%inline double->single ,(%mref ,rhs ,%zero ,(constant flonum-data-disp) fp))))]
                 [(fp-void)
                  (lambda () `(nop))]
-                [(fp-ftd& ,ftd)
+                [(fp-ftd& ,ftd ,fptd)
                  (cond
                   [(cat-indirect-bytes result-cat)
                    ;; we passed the pointer to be filled, so nothing more to do here
@@ -3280,7 +3331,7 @@
             (let* ([arg-type* (info-foreign-arg-type* info)]
                    [result-type (info-foreign-result-type info)]
                    [ftd-result? (nanopass-case (Ltype Type) result-type
-                                  [(fp-ftd& ,ftd) #t]
+                                  [(fp-ftd& ,ftd ,fptd) #t]
                                   [else #f])]
                    [arg-type* (if ftd-result?
                                   (cdr arg-type*)

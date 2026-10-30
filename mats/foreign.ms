@@ -179,6 +179,8 @@
                              ls)])
            (syntax (= (let ([x (foreign-procedure name (p ...) double-float)])
                         (x v ...))
+                      (let ([x (foreign-procedure __atomic name (p ...) double-float)])
+                        (x v ...))
                       (+ v ...)))))))))
 
 (define foreign1.so (let ([p (find-source "foreign1.so")])
@@ -199,11 +201,21 @@
       (error? (load-shared-object 3))
     )
    ]
-  [(i3le ti3le a6le ta6le arm32le tarm32le arm64le tarm64le ppc32le tppc32le rv64le trv64le la64le tla64le)
+  [(i3le ti3le a6le ta6le arm32le tarm32le arm64le tarm64le
+         ppc32le tppc32le rv64le trv64le la64le tla64le
+         armv7le tarmv7le)
    (mat load-shared-object
       (file-exists? foreign1.so)
       (begin (load-shared-object foreign1.so) #t)
       (begin (load-shared-object "libc.so.6") #t)
+      (error? (load-shared-object 3))
+    )
+   ]
+  [(a6hk ta6hk)
+  (mat load-shared-object
+	(file-exists? foreign1.so)
+      (begin (load-shared-object foreign1.so) #t)
+      (begin (load-shared-object "libroot.so") #t)
       (error? (load-shared-object 3))
     )
    ]
@@ -315,6 +327,16 @@
 
 (mat foreign-procedure
    (procedure? (foreign-procedure "idiptr" (scheme-object) scheme-object))
+   (procedure? (foreign-procedure __errno "idiptr" (scheme-object) scheme-object))
+   (procedure? (meta-cond
+                [(windows?)
+                 (foreign-procedure __get_last_error "idiptr" (scheme-object) scheme-object)]
+                [else void]))
+   (error? (meta-cond
+            [(windows?)
+             (error #f "invalid foreign-procedure convention __get_last_error")]
+            [else
+             (lambda () (foreign-procedure __get_last_error "idiptr" (scheme-object) scheme-object))]))
    (error? (foreign-procedure "i do not exist" (scheme-object) scheme-object))
    (error? (begin (foreign-procedure "i do not exist" () scheme-object) 'q))
    (error? (if (foreign-procedure "i do not exist" () scheme-object) 'q 'q))
@@ -322,12 +344,32 @@
    (error? (begin (foreign-procedure 'foo () scheme-object) 'q))
    (error? (if (foreign-procedure 'foo () scheme-object) 'q 'q))
 
+   (error? (lambda () (foreign-procedure __bad_conv "foo" () scheme-object)))
+   (error? (lambda () (foreign-procedure __collect_safe __atomic "foo" () scheme-object)))
+   (error? (lambda () (foreign-procedure __atomic __collect_safe "foo" () scheme-object)))
+   (error? (meta-cond
+            [(windows?) (lambda () (foreign-procedure __errno __get_last_error "foo" () scheme-object))]
+            [else (error #f "conflicting foreign-procedure convention __get_last_error")]))
+   (error? (meta-cond
+            [(windows?) (lambda () (foreign-procedure __get_last_error __errno "foo" () scheme-object))]
+            [else (error #f "conflicting foreign-procedure convention __errno")]))
+   (error? (lambda () (foreign-procedure __alloc "foo" () scheme-object)))
+
    (eq? 'foo ((foreign-procedure "idiptr" (scheme-object) scheme-object) 'foo))
+
+   (procedure? (foreign-procedure __atomic "idiptr" (scheme-object) scheme-object))
+   (error? (foreign-procedure __atomic "i do not exist" (scheme-object) scheme-object))
+   (eq? 'foo ((foreign-procedure __atomic "idiptr" (scheme-object) scheme-object) 'foo))
+   (eq? 'foo ((foreign-procedure __atomic __alloc "idiptr" (scheme-object) scheme-object) 'foo))
 
    (parameterize ([current-eval interpret])
        (eq? 'foo ((foreign-procedure "idiptr" (scheme-object) scheme-object) 'foo)))
 
    (not (eq? 'foo ((foreign-procedure "idiptr" (scheme-object) void) 'foo)))
+   (not (eq? 'foo ((foreign-procedure __atomic "idiptr" (scheme-object) void) 'foo)))
+
+   (parameterize ([current-eval interpret])
+       (eq? 'foo ((foreign-procedure __atomic "idiptr" (scheme-object) scheme-object) 'foo)))
 
    (begin (define idint32 (foreign-procedure "id" (integer-32) integer-32))
           (procedure? idint32))
@@ -347,6 +389,25 @@
    (error? (idint32 #x-8000000080000000))
    (error? (idint32 #f))
    (error? (idint32 "hi"))
+
+   (begin (define idint32-a (foreign-procedure __atomic "id" (integer-32) integer-32))
+          (procedure? idint32-a))
+   (eqv? (idint32-a 0) 0)
+   (eqv? (idint32-a #x7fffffff) #x7fffffff)
+   (eqv? (idint32-a -1) -1)
+   (eqv? (idint32-a #x-7fffffff) #x-7fffffff)
+   (eqv? (idint32-a #x-80000000) #x-80000000)
+   (eqv? (idint32-a #x80000000) (+ #x-100000000 #x80000000))
+   (eqv? (idint32-a #x80000001) (+ #x-100000000 #x80000001))
+   (eqv? (idint32-a #xffffffff) (+ #x-100000000 #xffffffff))
+   (error? (idint32-a #x100000000))
+   (error? (idint32-a #x100000001))
+   (error? (idint32-a #xfffffffffffffffffffffffffffff))
+   (error? (idint32-a #x8000000080000000))
+   (error? (idint32-a #x-80000001))
+   (error? (idint32-a #x-8000000080000000))
+   (error? (idint32-a #f))
+   (error? (idint32-a "hi"))
 
    (begin (define iduns32 (foreign-procedure "id" (unsigned-32) unsigned-32))
           (procedure? iduns32))
@@ -372,6 +433,9 @@
    (eqv? #xffffffff ((foreign-procedure "id" (integer-32) unsigned-32) -1))
    (eqv? -1 ((foreign-procedure "id" (unsigned-32) integer-32) #xffffffff))
 
+   (eqv? #xffffffff ((foreign-procedure __atomic "id" (integer-32) unsigned-32) -1))
+   (eqv? -1 ((foreign-procedure __atomic "id" (unsigned-32) integer-32) #xffffffff))
+
    (begin (define idfix (foreign-procedure "idiptr" (fixnum) fixnum))
           (procedure? idfix))
    (eqv? 0 (idfix 0))
@@ -395,6 +459,11 @@
    (error? (foreign-procedure "id" () chare))
    (error? (foreign-procedure "id" (void) char))
 
+   (error? (foreign-procedure __atomic "id" (booleen) char))
+   (error? (foreign-procedure __atomic "id" (integer-32 integer-34) char))
+   (error? (foreign-procedure __atomic "id" () chare))
+   (error? (foreign-procedure __atomic "id" (void) char))
+
    ((foreign-procedure "id" (boolean) boolean) #t)
    (not ((foreign-procedure "id" (boolean) boolean) #f))
    ((foreign-procedure "id" (boolean) boolean) 0)
@@ -403,6 +472,12 @@
    (= 0 ((foreign-procedure "id" (boolean) integer-32) #f))
    (not ((foreign-procedure "id" (integer-32) boolean) 0))
    ((foreign-procedure "id" (integer-32) boolean) 1)
+
+   (= 1 ((foreign-procedure __atomic "id" (boolean) integer-32) #t))
+   (= 1 ((foreign-procedure __atomic "id" (boolean) integer-32) 0))
+   (= 0 ((foreign-procedure __atomic "id" (boolean) integer-32) #f))
+   (not ((foreign-procedure __atomic "id" (integer-32) boolean) 0))
+   ((foreign-procedure __atomic "id" (integer-32) boolean) 1)
 
    (char=? #\a ((foreign-procedure "id" (char) char) #\a))
    (= 0 ((foreign-procedure "id" (char) integer-32) #\nul))
@@ -436,6 +511,12 @@
          (= 0 ((foreign-procedure (if (windows?) "windows_strcmp" "strcmp") (u8* string) integer-32) bv s)))))
    (error? ((foreign-procedure "id" (string) void) 'foo))
 
+   (let ([id1 (foreign-procedure __atomic "idiptr" (string) string)]
+         [id2 (foreign-procedure __atomic "idiptr" (string) iptr)]
+         [id3 (foreign-procedure __atomic "idiptr" (iptr) string)])
+      (and (eq? (id1 #f) #f) (eq? (id2 #f) 0) (eq? (id3 0) #f)))
+   (error? ((foreign-procedure __atomic "id" (string) void) 'foo))
+
    (= ((foreign-procedure "idid" (integer-32) integer-32) #xc7c7c7) #xc7c7c7)
    (= ((foreign-procedure "ididid" (integer-32) integer-32) #x7c7c7c7c)
       #x7c7c7c7c)
@@ -443,6 +524,10 @@
    (= ((foreign-procedure "id" (unsigned-32) unsigned-32) #x80000000)
       #x80000000)
    (= ((foreign-procedure "id" (unsigned-32) integer-32) #x80000000)
+      #x-80000000)
+   (= ((foreign-procedure __atomic "id" (unsigned-32) unsigned-32) #x80000000)
+      #x80000000)
+   (= ((foreign-procedure __atomic "id" (unsigned-32) integer-32) #x80000000)
       #x-80000000)
 
    (error? (foreign-procedure 'abcde (integer-32) integer-32))
@@ -460,6 +545,10 @@
    (= 1.1 ((foreign-procedure "float_id" (double-float) double-float) 1.1))
    (error? ((foreign-procedure "float_id" (double-float) void) 0))
 
+   (= 0.0 ((foreign-procedure __atomic "float_id" (double-float) double-float) 0.0))
+   (= 1.1 ((foreign-procedure __atomic "float_id" (double-float) double-float) 1.1))
+   (error? ((foreign-procedure __atomic "float_id" (double-float) void) 0))
+
    (let ([fid (foreign-procedure "float_id" (double-float) double-float)])
      (let f ((n 10000))
        (or (= n 0)
@@ -475,8 +564,23 @@
           integer-32)
        29 31 37 41 43 47 49 53 59 61))
 
+   (= (+ (*  1 29) (*  2 31) (*  3 37) (*  5 41) (*  7 43)
+         (* 11 47) (* 13 49) (* 17 53) (* 19 59) (* 23 61))
+      ((foreign-procedure __atomic "testten"
+          (integer-32 integer-32 integer-32 integer-32 integer-32
+           integer-32 integer-32 integer-32 integer-32 integer-32)
+          integer-32)
+       29 31 37 41 43 47 49 53 59 61))
+
    (= (+ 1.1 2.2 3.3 4.4 5.5 6.6 7.7 8.8)
       ((foreign-procedure "flsum8"
+          (double-float double-float double-float double-float
+           double-float double-float double-float double-float)
+          double-float)
+       1.1 2.2 3.3 4.4 5.5 6.6 7.7 8.8))
+
+   (= (+ 1.1 2.2 3.3 4.4 5.5 6.6 7.7 8.8)
+      ((foreign-procedure __atomic "flsum8"
           (double-float double-float double-float double-float
            double-float double-float double-float double-float)
           double-float)
@@ -664,6 +768,7 @@
     (define rt-int (foreign-procedure "rt_int" (iptr) ptr))
     (define rt-int32 (foreign-procedure "rt_int32" (integer-32) ptr))
     (define rt-int64 (foreign-procedure "rt_int64" (integer-64) ptr))
+    (define rt-int64/atomic (foreign-procedure __atomic __alloc "rt_int64" (integer-64) ptr))
     (define rt-uint (foreign-procedure "rt_uint" (uptr) ptr))
     (define rt-uint32 (foreign-procedure "rt_uint32" (unsigned-32) ptr))
     (define rt-uint64 (foreign-procedure "rt_uint64" (unsigned-64) ptr))
@@ -705,6 +810,12 @@
   (check #f (rt-int64 (- (ash 1 63))))
   (let ([n (+ -1 (ash 1 63))])
     (check n (rt-int64 n)))
+  (let loop ([i 1000])
+     (or (fx= i 0)
+         (and (check #f (rt-int64/atomic (ash 1 63)))
+              (loop (sub1 i)))))
+  (let ([n (+ -1 (ash 1 63))])
+    (check n (rt-int64/atomic n)))
 
   (check 0 (rt-uint 0))
   (check #f (rt-uint -1))
@@ -975,6 +1086,7 @@
     (define call-u8* (foreign-procedure "call_u8_star" (ptr u8*) u8*))
     (define call-u16* (foreign-procedure "call_u16_star" (ptr u16*) u16*))
     (define call-u32* (foreign-procedure "call_u32_star" (ptr u32*) u32*))
+    (define call-void* (foreign-procedure "call_u8_star" (ptr ftype-pointer) ftype-pointer))
     (define $bytevector-map
       (lambda (p bv)
         (u8-list->bytevector (map p (bytevector->u8-list bv)))))
@@ -983,7 +1095,7 @@
     (call-u8* (foreign-callable
                 (lambda (x) ($bytevector-map (lambda (x) (if (= x 255) 0 (+ x 100))) x))
                 (u8*) u8*)
-      #vu8(1 2 3 4 5 255 0 ))
+      #vu8(1 2 3 4 5 255 0))
     '#vu8(103 104 105))
   (equal?
     (call-u16* (foreign-callable
@@ -1027,6 +1139,21 @@
                  (lambda (x) (list x (bytevector-length x)))
                  (u32*) u32*)
       '#(1 2 3 4 5 6 7 8 0 0 0 0)))
+  (equal?
+   (let* ([r (call-void* (foreign-callable
+                          (lambda (x)
+                            (let* ([x (reference-address->object (- (ftype-pointer-address x) 1))]
+                                   [bv ($bytevector-map (lambda (x) (if (= x 255) 0 (+ x 100))) x)])
+                              ;; lock, because a GC could happen between the foreign-call return
+                              ;; and the point where we convert the reference address to an object
+                              (lock-object bv)
+                              (make-ftype-scheme-object-pointer bv)))
+                          (ftype-pointer) ftype-pointer)
+                         (make-ftype-scheme-object-pointer #vu8(1 2 3 4 5 255 0)))]
+          [new-bv (reference-address->object (- (ftype-pointer-address r) 1))])
+     (unlock-object new-bv)
+     new-bv)
+    '#vu8(101 102 103 104 105 0 100))
 )
 
 (mat foreign-strings
@@ -1602,7 +1729,7 @@
       (foreign-procedure "ufoo64a" (unsigned-64 unsigned-64 unsigned-64 unsigned-64 unsigned-64 unsigned-64 unsigned-64)
         unsigned-64))
     (define ufoo64b
-      (foreign-procedure "ufoo64b" (integer-32 unsigned-64 unsigned-64 unsigned-64 unsigned-64 unsigned-64 unsigned-64 unsigned-64)
+      (foreign-procedure "ufoo64b" (unsigned-32 unsigned-64 unsigned-64 unsigned-64 unsigned-64 unsigned-64 unsigned-64 unsigned-64)
         unsigned-64))
     (define test-ufoo
       (lambda (foo x a b c d e f g)
@@ -1972,6 +2099,9 @@
     (define B->uptr (foreign-procedure "uptr_to_uptr" ((* B) int) uptr))
     (define uptr->A (foreign-procedure "uptr_to_uptr" (uptr int) (* A)))
     (define b ((foreign-procedure (if (windows?) "windows_malloc" "malloc") (ssize_t) (* B)) (ftype-sizeof B)))
+    (define void*->void* (foreign-procedure "uptr_to_uptr" (ftype-pointer int) ftype-pointer))
+    (define obj-void*->obj-void* (foreign-procedure "uptr_to_uptr" (ftype-scheme-object-pointer int) ftype-scheme-object-pointer))
+    (define void*->obj-void* (foreign-procedure "uptr_to_uptr" (ftype-pointer int) ftype-scheme-object-pointer))
     #t)
   (eqv?
     (ftype-pointer-address (uptr->A (ftype-pointer-address (ftype-&ref B (y) b)) 0))
@@ -2238,6 +2368,135 @@
     #t)
   (eqv? (ftype-pointer-address ((ftype-ref A () a) a)) (ftype-pointer-address a))
 
+  (error? (void*->void* 0 0))
+  (ftype-pointer-null? (void*->void* (make-ftype-pointer integer-8 0) 0))
+  (error? (ftype-ref integer-8 (void*->void* (make-ftype-pointer integer-8 0) 0)))
+  (let* ([addr (foreign-alloc (ftype-sizeof integer-8))]
+         [p (make-ftype-pointer integer-8 addr)])
+    (and
+     (equal? (+ addr 3) (ftype-pointer-address (void*->void* p 3)))
+     (begin (foreign-free addr) #t)))
+  (let* ([bv (bytevector 1 2 3 4 5)]
+         [p (make-ftype-scheme-object-pointer bv 2)])
+    (collect)
+    (lock-object bv)
+    (and
+     (eqv? (+ (object->reference-address bv) 3)
+           (ftype-pointer-address (void*->void* p 1)))
+     (begin (unlock-object bv)
+            #t)))
+
+  (let* ([bv (bytevector 1 2 3 4 5)]
+         [p (make-ftype-scheme-object-pointer bv -1)])
+    (let ([new-p (obj-void*->obj-void* p 1)])
+      (collect)
+      (and (ftype-scheme-object-pointer? new-p)
+           (eq? bv (ftype-scheme-object-pointer-object new-p)))))
+
+  (let* ([bv (bytevector 1 2 3 4 5)]
+         [p (make-ftype-scheme-object-pointer bv -1)])
+    (let ([new-p (void*->obj-void* p 1)])
+      (collect)
+      (and (ftype-scheme-object-pointer? new-p)
+           (eq? bv (ftype-scheme-object-pointer-object new-p)))))
+
+  (error?
+   (obj-void*->obj-void* (make-ftype-pointer integer-8 1) 0))
+
+  (ftype-pointer-null? (void*->obj-void* (make-ftype-pointer integer-8 0) 0))
+  (ftype-pointer-null? (void*->obj-void* (make-ftype-pointer integer-8 -1) 1))
+
+  (begin
+    (define-ftype IUI (struct [a int] [b unsigned-int] [c int]))
+    (define-ftype unsigned-int-ptr (* unsigned-int))
+    (define get-int-uint-int (foreign-procedure "get_int_uint_int" (int unsigned-int int) (& IUI)))
+    (define get-int-uint-int-as-ptr (foreign-procedure "get_int_uint_int" (int unsigned-int int) (& IUI ftype-pointer)))
+    (define get-int-uint-int-as-uint* (foreign-procedure "get_int_uint_int" (int unsigned-int int) (& IUI unsigned-int-ptr)))
+    (define-ftype iui-callback (function ((& IUI)) int))
+    (define-ftype iui-callback-as-ptr (function ((& IUI ftype-pointer)) int))
+    (define-ftype iui-callback-as-uint* (function ((& IUI unsigned-int-ptr)) int))
+    (define call-with-int-uint-int (foreign-procedure "call_with_int_uint_int" ((* iui-callback) int unsigned-int int) int))
+    (define call-with-int-uint-int-as-ptr (foreign-procedure "call_with_int_uint_int" ((* iui-callback-as-ptr) int unsigned-int int) int))
+    (define call-with-int-uint-int-as-uint* (foreign-procedure "call_with_int_uint_int" ((* iui-callback-as-uint*) int unsigned-int int) int))
+    #t)
+
+  (let* ([addr (foreign-alloc (ftype-sizeof IUI))]
+         [p (make-ftype-pointer IUI addr)])
+    (get-int-uint-int p -10 3 100)
+    (and (= -9 (ftype-ref IUI (a) p))
+         (= -9 (ftype-ref int () p))
+         (= 6 (ftype-ref IUI (b) p))
+         (= 99 (ftype-ref IUI (c) p))
+         (begin (foreign-free addr) #t)))
+
+  (let* ([addr (foreign-alloc (ftype-sizeof IUI))]
+         [p (make-ftype-pointer int addr)])
+    (get-int-uint-int-as-ptr p -10 3 100)
+    (and (= -9 (ftype-ref int () p))
+         (= 6 (ftype-any-ref unsigned-int () p (ftype-sizeof int)))
+         (= 99 (ftype-ref int () p 2))
+         (begin (foreign-free addr) #t)))
+
+  (let* ([addr (foreign-alloc (ftype-sizeof IUI))]
+         [p (make-ftype-pointer unsigned-int addr)])
+    (get-int-uint-int-as-ptr p -10 3 100)
+    (and (= 4294967287 (ftype-ref unsigned-int () p))
+         (= 6 (ftype-ref unsigned-int () p 1))
+         (= 99 (ftype-ref unsigned-int () p 2))
+         (begin (foreign-free addr) #t)))
+
+  (let* ([bv (make-bytevector (ftype-sizeof IUI))]
+         [p (make-ftype-scheme-object-pointer bv)])
+    (get-int-uint-int-as-ptr p -10 3 100)
+    (and (= -9 (bytevector-s32-native-ref bv 0))
+         (= 6 (bytevector-s32-native-ref bv 4))
+         (= 99 (bytevector-s32-native-ref bv 8))))
+
+  (error? (let* ([addr (foreign-alloc (ftype-sizeof IUI))]
+                 [p (make-ftype-pointer IUI addr)])
+            (dynamic-wind
+             void
+             (lambda () (get-int-uint-int-as-uint* p -10 3 100))
+             (lambda () (foreign-free addr)))))
+
+  (error? (let* ([addr (foreign-alloc (ftype-sizeof IUI))]
+                 [p (make-ftype-pointer int addr)])
+            (dynamic-wind
+             void
+             (lambda () (get-int-uint-int p -10 3 100))
+             (lambda () (foreign-free addr)))))
+
+  (let* ([cb (lambda (p) ; IUI pointer
+               (+ (ftype-ref IUI (a) p)
+                  (ftype-ref int () p)
+                  (ftype-ref IUI (b) p)
+                  (ftype-ref IUI (c) p)))]
+         [p (make-ftype-pointer iui-callback cb)])
+    (and (= 87 (call-with-int-uint-int p -10 3 100))
+         (begin
+           (unlock-object (foreign-callable-code-object (ftype-pointer-address p)))
+           #t)))
+
+  (let* ([cb (lambda (p) ; generic pointer
+               (+ (ftype-any-ref int () p)
+                  (ftype-any-ref int () p (ftype-sizeof int))
+                  (ftype-any-ref int () p (* 2 (ftype-sizeof int)))))]
+         [p (make-ftype-pointer iui-callback-as-ptr cb)])
+    (and (= 96 (call-with-int-uint-int-as-ptr p -10 3 100))
+         (begin
+           (unlock-object (foreign-callable-code-object (ftype-pointer-address p)))
+           #t)))
+
+  (let* ([cb (lambda (p) ; unsigned-int pointer
+               (+ (quotient (ftype-ref unsigned-int () p) 16)
+                  (ftype-ref unsigned-int () p 1)
+                  (ftype-ref unsigned-int () p 2)))]
+         [p (make-ftype-pointer iui-callback-as-uint* cb)])
+    (and (= (+ (quotient 4294967287 16) 6 99) (call-with-int-uint-int-as-uint* p -10 3 100))
+         (begin
+           (unlock-object (foreign-callable-code-object (ftype-pointer-address p)))
+           #t)))
+
   (begin 
     (define-ftype A (struct [x uptr] [y uptr]))
     (define a (make-ftype-pointer A (foreign-alloc (ftype-sizeof A))))
@@ -2340,6 +2599,25 @@
                             double)])
     (= (proc 1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0 three-floats 9.0)
        (+ 1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0 10.0 11.0 12.0 9.0)))
+
+  (let ([proc
+         (foreign-procedure "many_doubles_and_three_floats_and_float" (double double double double double double double double (& three_floats ftype-pointer) float)
+                            double)]
+        [proc2
+         (foreign-procedure "many_doubles_and_three_floats_and_float" (double double double double double double double double (& three_floats ftype-scheme-object-pointer) float)
+                            double)]
+        [bv (make-bytevector (ftype-sizeof three_floats))])
+    (define (call proc three-floats)
+      (= (proc 1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0 three-floats 9.0)
+         (+ 1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0 10.0 11.0 12.0 9.0)))
+    (let loop ([i 0])
+      (unless (= i (ftype-sizeof three_floats))
+        (bytevector-s8-set! bv i (ftype-any-ref integer-8 () three-floats i))
+        (loop (add1 i))))
+    (and (call proc three-floats)
+         (call proc (make-ftype-pointer integer-8 (ftype-pointer-address three-floats)))
+         (call proc (make-ftype-scheme-object-pointer bv 0))
+         (call proc2 (make-ftype-scheme-object-pointer bv 0))))
 
   (let ([proc
          (foreign-procedure "many_doubles_and_float_and_three_floats" (double double double double double double double double float (& three_floats))
@@ -2644,7 +2922,7 @@
       x)
     43)
   (equal?
-    (let ()
+    (let ([keeps '()])
      ; foreign_callable example adapted from foreign.stex
       (define cb-init
         (foreign-procedure "cb_init" () void))
@@ -2656,6 +2934,7 @@
       (define callback
         (lambda (p)
           (let ([code (foreign-callable p (char) void)])
+            (set! keeps (cons code keeps))
             (foreign-callable-entry-point code))))
       (let ()
         (define ouch
@@ -2674,6 +2953,7 @@
   
         (parameterize ([current-output-port (open-output-string)])
           (event-loop "abcde")
+          (keep-live keeps)
           (get-output-string (current-output-port)))))
     (format "Ouch! Hit by 'a'~%Rats! Received 'c'~%Ouch! Hit by 'e'~%"))
    ; make sure foreign-procedure's code-object is properly locked when
@@ -2994,6 +3274,41 @@
      (call-with-many-args (foreign-callable-entry-point cb)))
     result)
 
+  (machine-case
+   [(ta6nt a6nt)
+    ;; check that callables save all 128 bits of XMM registers
+    (let ()
+      (define-ftype callback (function () void))
+      (define-ftype callback/collect-safe (function __collect_safe () void))
+      (define void-fptr (make-ftype-pointer callback void))
+      (define void-fptr/collect-safe (make-ftype-pointer callback/collect-safe void))
+      (define out1 (make-bytevector 16))
+      (define out2 (make-bytevector 16))
+      (define in '#vu8(00 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15
+		       20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35
+		       40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55
+		       60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75))
+      (define expected '#vu8(100 104 108 112 212 216 220 224 228 232 236 240 20 25 29 33))
+      (define call_with_preserved_xmm
+	(foreign-procedure "call_with_preserved_xmm"
+			   ((* callback) u8* u8*)
+			   int))
+      (define call_with_preserved_xmm/collect-safe
+	(foreign-procedure "call_with_preserved_xmm"
+			   ((* callback/collect-safe) u8* u8*)
+			   int))
+      (lock-object out1)
+      (lock-object out2)
+      (call_with_preserved_xmm void-fptr in out1)
+      (call_with_preserved_xmm/collect-safe void-fptr/collect-safe in out2)
+      (unlock-object out1)
+      (unlock-object out2)
+      (unlock-object (foreign-callable-code-object (ftype-pointer-address void-fptr)))
+      (unlock-object (foreign-callable-code-object (ftype-pointer-address void-fptr/collect-safe)))
+      (and (equal? out1 expected)
+	   (equal? out2 expected)))]
+   [else #t])
+
 )
 
 (machine-case
@@ -3100,8 +3415,11 @@
       (machine-case
         [(i3ob ti3ob a6ob ta6ob a6s2 ta6s2 i3s2 ti3s2 i3qnx ti3qnx i3nb ti3nb a6nb ta6nb)
          '(load-shared-object "libc.so")]
-        [(i3le ti3le a6le ta6le arm32le tarm32le arm64le tarm64le ppc32le tppc32le rv64le trv64le la64le tla64le)
+        [(i3le ti3le a6le ta6le arm32le tarm32le arm64le tarm64le ppc32le tppc32le
+               rv64le trv64le la64le tla64le armv7le tarmv7le)
          '(load-shared-object "libc.so.6")]
+	[(a6hk ta6hk)
+	 '(load-shared-object "libroot.so")]
         [(i3fb ti3fb a6fb ta6fb)
          '(load-shared-object "libc.so.7")]
         [(i3nt ti3nt a6nt ta6nt arm64nt tarm64nt)
@@ -3210,7 +3528,7 @@
     (define-ftype i64 integer-64)
     (define-syntax check*
       (syntax-rules ()
-        [(_ (conv ...) T s [vi ...] [T-ref ...] [T-set! ...])
+        [(_ foreign-procedure (conv ...) T s [vi ...] [T-ref ...] [T-set! ...])
          (let ()
            (define-ftype callback (function conv ... ((& T)) double))
            (define-ftype callback-two (function conv ... ((& T) (& T)) double))
@@ -3316,11 +3634,34 @@
                        (begin
                          (free_at_boundary (ftype-pointer-address a))
                          #t)))))]))
+    (define-syntax foreign-procedure/discard-errno
+      (lambda (stx)
+        (syntax-case stx ()
+          [(_ a ...)
+           #'(let ([f (foreign-procedure a ...)])
+               (lambda args
+                 (call-with-values
+                  (lambda () (apply f args))
+                  (lambda (v errno)
+                    (unless (and (integer? errno) (exact? errno)) (errorf 'foreign "not a valid errno result ~s" errno))
+                    v))))])))
+    ;; used to get broad coverage, on average, without inflating test times too much
+    (define-syntax randomly
+      (lambda (stx)
+        (syntax-case stx ()
+          [(_ e)
+           (if (< (random 1.0) 0.1)
+               #'e
+               #'#t)])))
     (define-syntax check*t
       (syntax-rules ()
         [(_ arg ...)
-         (and (check* () arg ...)
-              (check* (__collect_safe) arg ...))]))
+         (and (check* foreign-procedure () arg ...)
+              (check* foreign-procedure (__collect_safe) arg ...)
+              (randomly
+               (check* foreign-procedure/discard-errno (__errno) arg ...))
+              (randomly
+               (check* foreign-procedure/discard-errno (__collect_safe __errno) arg ...)))]))
     (define-syntax check-n
       (syntax-rules ()
         [(_ [ni ti vi] ...)
@@ -3514,6 +3855,28 @@
           (let ([v (cb_send cb)])
             (and (= v 112.25)
                  (loop (sub1 i))))]))))
+
+  (let ()
+    (define-ftype intfloat (struct
+                             [i int]
+                             [f float]))
+    (define-ftype callback (function (int float) (& intfloat)))
+    (define intfloat_sum_built
+      (foreign-procedure "intfloat_sum_built"
+                         ((* callback)) double))
+    (let ([cb (make-ftype-pointer
+               callback
+               (lambda (r i f)
+                 (ftype-set! intfloat (i) r i)
+                 (ftype-set! intfloat (f) r f)))])
+      (and (equal? (intfloat_sum_built cb)
+                   110.0)
+           (begin
+             (unlock-object
+              (foreign-callable-code-object
+               (ftype-pointer-address cb)))
+             #t))))
+
   )
 
 (mat collect-safe
@@ -3532,6 +3895,7 @@
   (error? (foreign-callable __collect_safe (lambda () #f) () string))
   (error? (foreign-callable __collect_safe (lambda () #f) () wstring))
   (begin
+    (define $can-collect-safe? (and (threaded?) (foreign-procedure "(cs)collect_safe_supported" () boolean)))
     (define-ftype thread-callback-T (function __collect_safe (double) double))
     (define (call-with-thread-callback cb-proc proc)
       (let* ([exception #f]
@@ -3565,7 +3929,7 @@
           call-in-unknown-thread-1))
     (define call-in-unknown-thread-3
       ;; Call in a truly unknown thread:
-      (if (threaded?)
+      (if (and (threaded?) ($can-collect-safe?))
           (let ([call (foreign-procedure "call_in_unknown_thread"
                                          ((* thread-callback-T) double int boolean boolean)
                                          double)])
@@ -3578,7 +3942,7 @@
       ;; In an truly unknown thread, but also using `__collect_safe` to
       ;; deactivate the current thread instead of using `Sdeactivate_thread`
       ;; within the foreign function:
-      (if (threaded?)
+      (if (and (threaded?) ($can-collect-safe?))
           (let ([call (foreign-procedure __collect_safe "call_in_unknown_thread"
                                          ((* thread-callback-T) double int boolean boolean)
                                          double)])
@@ -3644,6 +4008,7 @@
   ;; doesn't use a huge amount of memory --- that is, that some of the
   ;; threads trigger a GC
   (or (not (threaded?))
+      (not ($can-collect-safe?))
       (let ([old-max (maximum-memory-bytes)])
         (let ([call (foreign-procedure __collect_safe
                                        "call_in_many_unknown_threads" (uptr int int)
@@ -3659,6 +4024,91 @@
            (begin
              (unlock-object callable)
              (< (maximum-memory-bytes) (* 1.2 old-max)))))))
+  )
+
+(mat save-errno
+  (begin
+    (define set-errno-value
+      (foreign-procedure __errno "set_errno_value" (int) int))
+    (define set-errno-value/collect-safe
+      (foreign-procedure __errno __collect_safe "set_errno_value" (int) int))
+    (define set-last-error-value
+      (meta-cond
+       [(windows?)
+        (foreign-procedure __get_last_error "set_last_error_value" (int) int)]
+       [else
+        set-errno-value]))
+    (define set-last-error-value/collect-safe
+      (meta-cond
+       [(windows?)
+        (foreign-procedure __get_last_error __collect_safe "set_last_error_value" (int) int)]
+       [else
+        set-errno-value/collect-safe]))
+    #t)
+  (equal? (call-with-values (lambda () (set-errno-value 123)) list)
+          (list 124 123))
+  (equal? (call-with-values (lambda () (set-errno-value/collect-safe 125)) list)
+          (list 126 125))
+  (equal? (call-with-values (lambda () (set-last-error-value 127)) list)
+          (list 128 127))
+  (equal? (call-with-values (lambda () (set-last-error-value/collect-safe 129)) list)
+          (list 130 129))
+)
+
+(mat disable-interrupts
+  (begin
+    (define (check-foreign-call-interrupt-disable disable-on-call? disable-on-callback?)
+      (let ([old-timer-handler (timer-interrupt-handler)]
+            [old-collect-handler (collect-request-handler)])
+        (define-ftype int->int (function (int) int))
+        (define-ftype int->int* (function __disable_interrupts (int) int))
+        (define hit 0)
+        (define call (if disable-on-callback?
+                         (foreign-procedure "call_for_interrupt_test" ((* int->int*) int) int)
+                         (foreign-procedure "call_for_interrupt_test" ((* int->int) int) int)))
+        (define call* (if disable-on-callback?
+                          (foreign-procedure __disable_interrupts "call_for_interrupt_test" ((* int->int*) int) int)
+                          (foreign-procedure __disable_interrupts "call_for_interrupt_test" ((* int->int) int) int)))
+        (define in? (foreign-procedure "is_in_callback_for_interrupt_test" () boolean))
+
+        (define (callback x)
+          (+ 1 (string-length (make-string x))))
+
+        (define callback-ptr (if disable-on-callback?
+                                 (make-ftype-pointer int->int* callback)
+                                 (make-ftype-pointer int->int callback)))
+
+        (timer-interrupt-handler (lambda ()
+                                   (set! hit (add1 hit))
+                                   (when (in?) (error 'timeout "inside!"))
+                                   (set-timer (add1 (random 100)))))
+        (collect-request-handler (lambda ()
+                                   (when (in?) (error 'timeout "inside for GC!"))
+                                   (old-collect-handler)))
+
+        (set-timer (add1 (random 100)))
+        (let loop ([i 10000])
+          (unless (zero? i)
+            (unless (eqv? (+ i 1)
+                          (if disable-on-call?
+                              (call* callback-ptr i)
+                              (call callback-ptr i)))
+              (error 'call "bad result"))
+            (loop (sub1 i))))
+
+        (set-timer 0)
+        (timer-interrupt-handler old-timer-handler)
+        (collect-request-handler old-collect-handler)
+
+        (unlock-object
+         (foreign-callable-code-object
+          (ftype-pointer-address callback-ptr)))
+
+        (positive? hit)))
+    #t)
+  (check-foreign-call-interrupt-disable #t #f)
+  (check-foreign-call-interrupt-disable #f #t)
+  (check-foreign-call-interrupt-disable #t #t)
 )
 
 (machine-case
@@ -3852,3 +4302,26 @@
     (bytevector-reference-set! $reftest-bv-odd 0 #f)
     (eq? #f (bytevector-reference-ref $reftest-bv-odd 0)))
 )
+
+(mat reference-bytevector-implementation-restriction
+  (parameters [optimize-level 0])
+  (let ([too-large (+ (greatest-fixnum) 1)])
+    (define (implementation-restriction? thunk)
+      (guard (c [else (and (implementation-restriction-violation? c)
+                           (equal? (condition-message c)
+                             "~s exceeds the maximum bytevector length")
+                           (equal? (condition-irritants c) (list too-large)))])
+        (thunk)
+        #f))
+    (define (assertion? thunk)
+      (guard (c [else (and (assertion-violation? c)
+                           (not (implementation-restriction-violation? c)))])
+        (thunk)
+        #f))
+    (and
+      (implementation-restriction?
+        (lambda () (make-reference-bytevector too-large)))
+      (assertion? (lambda () (make-reference-bytevector -1)))
+      (implementation-restriction?
+        (lambda () (make-immobile-reference-bytevector too-large)))
+      (assertion? (lambda () (make-immobile-reference-bytevector -1))))))

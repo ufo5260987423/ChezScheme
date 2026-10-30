@@ -15,7 +15,8 @@ Supported platforms (bytecode interpreter may work for others):
  * OpenBSD: x86, x86_64, ARMv6, AArch64, PowerPC32
  * NetBSD: x86, x86_64, ARMv6, AArch64, PowerPC32
  * Solaris: x86, x86_64
- * GNU/Hurd: x86
+ * GNU/Hurd: x86, x86_64
+ * Haiku: x86_64
  * Android: ARMv7, AArch64
  * iOS: AArch64
  * WebAssembly via Emscripten (bytecode interpreter only)
@@ -67,7 +68,7 @@ The R6RS core of the Chez Scheme language is described in
 which also includes an introduction to Scheme and a set of example programs.
 Chez Scheme's additional language, run-time system, and
 programming environment features are described in the
-[Chez Scheme User's Guide](http://cisco.github.io/ChezScheme/csug10.0/csug.html).
+[Chez Scheme User's Guide](http://cisco.github.io/ChezScheme/csug/csug.html).
 The latter includes a shared index and a shared summary of forms,
 with links where appropriate to the former, so it is often the best
 starting point.

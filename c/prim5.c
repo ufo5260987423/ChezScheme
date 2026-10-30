@@ -103,6 +103,7 @@ static ptr s_get_reloc(ptr co, IBOOL with_offsets);
 #ifdef PTHREADS
 static s_thread_rv_t s_backdoor_thread_start(void *p);
 static iptr s_backdoor_thread(ptr p);
+static IBOOL s_collect_safe_supported(void);
 static ptr s_threads(void);
 static void s_mutex_acquire(ptr m);
 static ptr s_mutex_acquire_noblock(ptr m);
@@ -1051,7 +1052,7 @@ static ptr s_make_code(iptr flags, iptr free, ptr name, ptr arity_mark, iptr n, 
     ptr co;
     ptr tc = get_thread_context();
 
-    S_thread_start_code_write(tc, 0, 0, NULL, 0);
+    S_thread_start_code_write(tc, 0, 1, NULL, 0);
 
     co = S_code(tc, type_code | (flags << code_flags_offset), n);
     CODEFREE(co) = free;
@@ -1063,7 +1064,7 @@ static ptr s_make_code(iptr flags, iptr free, ptr name, ptr arity_mark, iptr n, 
       S_G.profile_counters = Scons(S_weak_cons(co, pinfos), S_G.profile_counters);
     }
 
-    S_thread_end_code_write(tc, 0, 0, NULL, 0);
+    S_thread_end_code_write(tc, 0, 1, NULL, 0);
 
     return co;
 }
@@ -1445,7 +1446,7 @@ static double s_exp(double x) { return exp(x); }
 
 static double s_log(double x) { return log(x); }
 
-static double s_log2(double x, double y) { return log(x) / log(y); }
+static double s_log_base(double x, double y) { return log(x) / log(y); }
 
 #if (machine_type == machine_type_i3fb || machine_type == machine_type_ti3fb)
 #include <ieeefp.h>
@@ -1463,34 +1464,31 @@ static double s_pow(double x, double y) {
   } else
     return pow(x, y);
 }
-#elif defined(MACOSX)
-/* intel macosx delivers precise results for integer inputs, e.g.,
- * 10.0^21.0, only with long double version of pow */
+#elif (machine_type == machine_type_i3osx || machine_type == machine_type_ti3osx)
+/* intel macosx delivers accurate results for integer inputs, e.g.,
+ * 10.0^21.0, only with long double version of pow; it's not clear
+ * whether that has been true for x86_64 as opposed to i386, but as
+ * of macOS 10.15 (Catalina), pow seems ok for x86_64 */
 static double s_pow(double x, double y) { return powl(x, y); }
-#else /* i3fb/ti3fb */
+#else /* i3fb/ti3fb/i3osx/ti3osx */
 static double s_pow(double x, double y) { return pow(x, y); }
-#endif /* i3fb/ti3fb */
+#endif /* i3fb/ti3fb/i3osx/ti3osx */
 
 #ifdef __MINGW32__
-/* cos() and sin() do not handle large values nicely,
-   so use fmod() to get reasonably close */
-# define INTO_SINCOS_RANGE(x) (((x > 1e9) || (x < -1e9)) \
-			       ? fmod(x, 2*atan2(0.0, -1.0)) \
-			       : x)
 /* asinh() and atanh() sometimes get zero sign wrong */
 # define CHECK_ASINTAN_ZERO(x, e) ((x == 0.0) \
                                    ? (signbit(x) ? -0.0 : 0.0)  \
                                    : e)
+/* see also "mingw.zuo" */
 #else
-# define INTO_SINCOS_RANGE(x) x
 # define CHECK_ASINTAN_ZERO(x, e) e
 #endif
 
 static double s_sqrt(double x) { return sqrt(x); }
 
-static double s_sin(double x) { return sin(INTO_SINCOS_RANGE(x)); }
+static double s_sin(double x) { return sin(x); }
 
-static double s_cos(double x) { return cos(INTO_SINCOS_RANGE(x)); }
+static double s_cos(double x) { return cos(x); }
 
 static double s_tan(double x) { return tan(x); }
 
@@ -1516,19 +1514,25 @@ static double s_round(double x) { return rint(x); }
 
 static double s_trunc(double x) { return trunc(x); }
 
+static double s_fma(double x, double y, double z) { return fma(x, y, z); }
+
 static double s_hypot(double x, double y) { return HYPOT(x, y); }
 
-#ifdef ARCHYPERBOLIC
+static double s_nextafter(double x, double y) { return nextafter(x, y); }
+
 static double s_asinh(double x) { return CHECK_ASINTAN_ZERO(x, asinh(x)); }
 
 static double s_acosh(double x) { return acosh(x); }
 
 static double s_atanh(double x) { return CHECK_ASINTAN_ZERO(x, atanh(x)); }
-#endif /* ARCHHYPERBOLIC */
 
-#ifdef LOG1P
 static double s_log1p(double x) { return log1p(x); }
-#endif /* LOG1P */
+
+static double s_log2(double x) { return log2(x); }
+
+static double s_expm1(double x) { return expm1(x); }
+
+static double s_exp2(double x) { return exp2(x); }
 
 static ptr s_getenv(char *name) {
 #ifdef WIN32
@@ -1593,6 +1597,14 @@ static s_thread_rv_t s_backdoor_thread_start(void *p_in) {
 static iptr s_backdoor_thread(ptr p) {
   display("creating thread\n");
   return s_thread_create(s_backdoor_thread_start, TO_VOIDP(p));
+}
+
+static IBOOL s_collect_safe_supported(void) {
+#if defined(WRITE_XOR_EXECUTE_CODE)
+  return 0;
+#else
+  return 1;
+#endif
 }
 
 static ptr s_threads() {
@@ -1733,6 +1745,7 @@ void S_prim5_init(void) {
     Sforeign_symbol("(cs)make_mutex", (void *)S_make_mutex);
     Sforeign_symbol("(cs)mutex_free", (void *)S_mutex_free);
     Sforeign_symbol("(cs)backdoor_thread", (void *)s_backdoor_thread);
+    Sforeign_symbol("(cs)collect_safe_supported", (void *)s_collect_safe_supported);
     Sforeign_symbol("(cs)threads", (void *)s_threads);
     Sforeign_symbol("(cs)mutex_acquire", (void *)s_mutex_acquire);
     Sforeign_symbol("(cs)mutex_release", (void *)s_mutex_release);
@@ -1831,6 +1844,7 @@ void S_prim5_init(void) {
     Sforeign_symbol("(cs)put_byte", (void*)S_put_byte);
     Sforeign_symbol("(cs)get_fd_pos", (void*)S_get_fd_pos);
     Sforeign_symbol("(cs)set_fd_pos", (void*)S_set_fd_pos);
+    Sforeign_symbol("(cs)fd_can_set_position", (void*)S_fd_can_set_pos);
     Sforeign_symbol("(cs)get_fd_non_blocking", (void*)S_get_fd_non_blocking);
     Sforeign_symbol("(cs)set_fd_non_blocking", (void*)S_set_fd_non_blocking);
     Sforeign_symbol("(cs)get_fd_length", (void*)S_get_fd_length);
@@ -1913,16 +1927,17 @@ void S_prim5_init(void) {
     Sforeign_symbol("(cs)floor", (void *)s_floor);
     Sforeign_symbol("(cs)ceil", (void *)s_ceil);
     Sforeign_symbol("(cs)hypot", (void *)s_hypot);
+    Sforeign_symbol("(cs)nextafter", (void *)s_nextafter);
+    Sforeign_symbol("(cs)fma", (void *)s_fma);
 
-#ifdef ARCHYPERBOLIC
     Sforeign_symbol("(cs)asinh", (void *)s_asinh);
     Sforeign_symbol("(cs)acosh", (void *)s_acosh);
     Sforeign_symbol("(cs)atanh", (void *)s_atanh);
-#endif /* ARCHHYPERBOLIC */
 
-#ifdef LOG1P
     Sforeign_symbol("(cs)log1p", (void *)s_log1p);
-#endif /* LOG1P */
+    Sforeign_symbol("(cs)log2", (void *)s_log2);
+    Sforeign_symbol("(cs)expm1", (void *)s_expm1);
+    Sforeign_symbol("(cs)exp2", (void *)s_exp2);
 
     Sforeign_symbol("(cs)s_get_reloc", (void *)s_get_reloc);
     Sforeign_symbol("(cs)getenv", (void *)s_getenv);
@@ -1972,8 +1987,21 @@ void S_prim5_init(void) {
     S_install_c_entry(CENTRY_flatan2, proc2ptr(s_atan2));
     S_install_c_entry(CENTRY_flexp, proc2ptr(s_exp));
     S_install_c_entry(CENTRY_fllog, proc2ptr(s_log));
-    S_install_c_entry(CENTRY_fllog2, proc2ptr(s_log2));
+    S_install_c_entry(CENTRY_fllog_base, proc2ptr(s_log_base));
     S_install_c_entry(CENTRY_flexpt, proc2ptr(s_pow));
+    S_install_c_entry(CENTRY_fllog1p, proc2ptr(s_log1p));
+    S_install_c_entry(CENTRY_fllog2, proc2ptr(s_log2));
+    S_install_c_entry(CENTRY_flexpm1, proc2ptr(s_expm1));
+    S_install_c_entry(CENTRY_flexp2, proc2ptr(s_exp2));
+    S_install_c_entry(CENTRY_flsinh, proc2ptr(s_sinh));
+    S_install_c_entry(CENTRY_flcosh, proc2ptr(s_cosh));
+    S_install_c_entry(CENTRY_fltanh, proc2ptr(s_tanh));
+    S_install_c_entry(CENTRY_flasinh, proc2ptr(s_asinh));
+    S_install_c_entry(CENTRY_flacosh, proc2ptr(s_acosh));
+    S_install_c_entry(CENTRY_flatanh, proc2ptr(s_atanh));
+    S_install_c_entry(CENTRY_flfma, proc2ptr(s_fma));
+    S_install_c_entry(CENTRY_flhypot, proc2ptr(s_hypot));
+    S_install_c_entry(CENTRY_flnextafter, proc2ptr(s_nextafter));
     S_install_c_entry(CENTRY_flsqrt, proc2ptr(s_sqrt));
 
     S_check_c_entry_vector();

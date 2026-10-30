@@ -567,7 +567,7 @@
             (constant rtd-opaque)
             0)
         (if sealed? (constant rtd-sealed) 0)))
-    (define ($mrt who base-rtd name parent uid flags fields anonymous-fields? extras)
+    (define ($mrt who base-rtd name parent uid flags fields anonymous-fields? alt-pm extras)
       (include "layout.ss")
       (when parent
         (when ($record-type-act-sealed? parent)
@@ -577,6 +577,15 @@
               ($oops who "cannot make anonymous-field record type ~s from named-field parent record type ~s" name parent))
             (when (fixnum? (rtd-flds parent))
               ($oops who "cannot make named-field record type ~s from anonymous-field parent record type ~s" name parent))))
+      (when alt-pm
+        (case alt-pm
+          [(#t) (let ([fields (append (if (not parent) '() (csv7:record-type-field-decls parent))
+                                      fields)])
+                  (unless (and (= 2 (length fields))
+                               (eq? 'uptr (cadr (car fields)))
+                               (eq? 'uptr (cadr (cadr fields))))
+                    ($oops who "fields ~s inconsistent with pointer-mask protocol ~s" fields alt-pm)))]
+          [else ($oops who "unrecognized alternative pointer-mask protocol ~s" alt-pm)]))
       (let ([uid (or uid ((current-generate-id) name))])
        ; start base offset at rtd field
        ; synchronize with syntax.ss and front.ss
@@ -626,15 +635,20 @@
                        (and (not (fixnum? flds1)) (not (fixnum? flds2))
                             (fx= (length flds1) (length flds2))
                             (andmap same-field? flds1 flds2)))))
-              ; following assumes extras match
                (let ()
                  (define (squawk what) ($oops who "incompatible record type ~s - ~a" name what))
                  (unless (eq? ($record-type-descriptor rtd) base-rtd) (squawk "different base rtd"))
                  (unless (eq? (rtd-parent rtd) parent) (squawk "different parent"))
                  (unless (same-fields? (rtd-flds rtd) (if (pair? flds) (cdr flds) (fx- flds 1))) (squawk "different fields"))
+                 (unless (eqv? (rtd-pm rtd) (or alt-pm pm)) (squawk "different pointer mask"))
                  (unless (= (rtd-mpm rtd) mpm) (squawk "different mutability"))
                  (unless (fx= (rtd-flags rtd) flags) (squawk "different flags"))
-                 (unless (eq? (rtd-size rtd) size) (squawk "different size")))
+                 (unless (eq? (rtd-size rtd) size) (squawk "different size"))
+                 (let f ([i (fx- (fxsrl (constant size-record-type) (constant log2-ptr-bytes)) 1)] [extras extras])
+                   (unless (null? extras)
+                     ;; fasl loading is more picky than `equal?`; it allows enough to accomodate "ftype.ss"
+                     (unless (equal? ($record-ref rtd i) (car extras)) (squawk "different extra"))
+                     (f (fx+ i 1) (cdr extras)))))
                rtd)]
             [else
              (let* ([len (if (not parent) 1 (vector-length (rtd-ancestry parent)))]
@@ -643,7 +657,7 @@
                  (unless (fx= i len)
                    (vector-set! ancestry i (vector-ref (rtd-ancestry parent) i))
                    (loop (fx+ i 1))))
-               (let ([rtd (apply #%$record base-rtd ancestry size pm mpm name
+               (let ([rtd (apply #%$record base-rtd ancestry size (or alt-pm pm) mpm name
                                  (if (pair? flds) (cdr flds) (fx- flds 1)) flags uid #f extras)])
                  (vector-set! ancestry len rtd)
                  (with-tc-mutex ($sputprop uid '*rtd* rtd))
@@ -658,7 +672,10 @@
                     [ancestry (rtd-ancestry rtd)]
                     [name (rtd-name rtd)]
                     [flags (rtd-flags rtd)]
-                    [old-flds (rtd-flds rtd)])
+                    [old-flds (rtd-flds rtd)]
+                    [alt-pm (let ([old-pm (rtd-pm rtd)])
+                              (and (not (or (fixnum? old-pm) (bignum? old-pm)))
+                                   old-pm))])
                 (let-values ([(pm mpm flds size)
                               (if (fixnum? old-flds)
                                   (compute-field-offsets who
@@ -687,7 +704,7 @@
                                            (car flds))
                                        (loop (cdr flds) (cdr old-flds) (cdr parent-flds) (cdr parent-old-flds)))])))
                           flds)))
-                  (let ([rtd (apply #%$record base-rtd ancestry size pm mpm name
+                  (let ([rtd (apply #%$record base-rtd ancestry size (or alt-pm pm) mpm name
                                (if (pair? flds)
                                    (share-with-remade-parent (cdr flds))
                                    (fx- flds 1))
@@ -703,18 +720,18 @@
                     rtd)))))))
 
     (let ()
-      (define (mrt base-rtd parent name fields sealed? opaque? extras)
+      (define (mrt base-rtd parent name fields sealed? opaque? alt-pm extras)
         (cond
           [(gensym? name)
            ($mrt 'make-record-type base-rtd
              (string->symbol (symbol->string name)) parent name
              (make-flags name sealed? opaque? parent)
-             fields #f extras)]
+             fields #f alt-pm extras)]
           [(string? name)
            ($mrt 'make-record-type base-rtd
              (string->symbol name) parent #f
              (make-flags #f sealed? opaque? parent)
-             fields #f extras)]
+             fields #f alt-pm extras)]
           [else ($oops 'make-record-type "invalid record name ~s" name)]))
 
       (set-who! make-record-type
@@ -723,26 +740,26 @@
             [(name fields)
              (unless (list? fields)
                ($oops who "invalid field list ~s" fields))
-             (mrt base-rtd #f name fields #f #f '())]
+             (mrt base-rtd #f name fields #f #f #f '())]
             [(parent name fields)
              (unless (or (not parent) (record-type-descriptor? parent))
                ($oops who "~s is not a record type descriptor"
                  parent))
              (unless (list? fields)
                ($oops who "invalid field list ~s" fields))
-             (mrt base-rtd parent name fields #f #f '())])))
+             (mrt base-rtd parent name fields #f #f #f '())])))
 
-      (set! $make-record-type
-        (lambda (base-rtd parent name fields sealed? opaque? . extras)
+      (set-who! $make-record-type
+        (lambda (base-rtd parent name fields sealed? opaque? alt-pm . extras)
           (unless (record-type-descriptor? base-rtd)
-            ($oops 'make-record-type "~s is not a record type descriptor"
+            ($oops who "~s is not a record type descriptor"
               base-rtd))
           (unless (or (not parent) (record-type-descriptor? parent))
-            ($oops 'make-record-type "~s is not a record type descriptor"
+            ($oops who "~s is not a record type descriptor"
               parent))
           (unless (list? fields)
-            ($oops 'make-record-type "invalid field list ~s" fields))
-          (mrt base-rtd parent name fields sealed? opaque? extras))))
+            ($oops who "invalid field list ~s" fields))
+          (mrt base-rtd parent name fields sealed? opaque? alt-pm extras))))
 
     (let ()
       (define (mrtd base-rtd name parent uid sealed? opaque? fields anon-ok? who extras)
@@ -787,6 +804,7 @@
                              ($oops who "invalid field specifier ~s" x))
                            (cons x (f (fx+ i 1)))))))])
               (pair? fields)
+              #f
               extras))
 
       (set! $make-record-type-descriptor

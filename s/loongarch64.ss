@@ -488,6 +488,14 @@
         `(set! ,(make-live-info) ,u (asm ,null-info ,asm-kill))
         `(asm ,info ,asm-unactivate-thread ,u)))])
 
+  (define-instruction value (save-errno)
+    [(op (z ur))
+     (safe-assert (eq? z %Cretval))
+     (let ([u (make-tmp 'u)])
+       (seq
+        `(set! ,(make-live-info) ,u (asm ,null-info ,asm-kill))
+        `(set! ,(make-live-info) ,z (asm ,info ,asm-save-errno ,u))))])
+
   (define-instruction value (asmlibcall)
     [(op (z ur))
      (let ([u (make-tmp 'asmlib)]) ;; for building jump addr
@@ -614,6 +622,7 @@
                     asm-direct-jump asm-indirect-jump asm-literal-jump asm-condition-code
                     asm-jump asm-conditional-jump asm-library-jump
                     asm-get-tc asm-activate-thread asm-deactivate-thread asm-unactivate-thread
+                    asm-save-errno
                     asm-push asm-pop asm-return asm-c-return asm-kill
                     asm-load asm-store asm-fence asm-swap asm-lock asm-lock+/-
                     asm-move asm-fpmove asm-fpmove-single asm-move/extend
@@ -1737,6 +1746,11 @@
       (lambda (code* tmp . ignore)
         (asm-helper-call code* target #f tmp))))
 
+  (define asm-save-errno
+    (let ([target `(loongarch64-call 0 (entry ,(lookup-c-entry save-errno)))])
+      (lambda (code* dest tmp . ignore) ; dest is ignored, since it is always Cretval
+        (asm-helper-call code* target #f tmp))))
+
   (define asm-push ;;@ todo alignment
     (lambda (code* x)
       (Trivit (x)
@@ -1840,7 +1854,7 @@
                 (nanopass-case (Ltype Type) (car types)
                                [(fp-double-float) (fp-arg)]
                                [(fp-single-float) (fp-arg)]
-                               [(fp-ftd& ,ftd)
+                               [(fp-ftd& ,ftd ,fptd)
                                 ;; A non-union with one floating-point member is treated
                                 ;;  like that member by itself.
                                 ;; A non-union that has exactly two members, at least one as
@@ -1942,7 +1956,7 @@
 
     (define (result-via-pointer-argument? type)
       (nanopass-case (Ltype Type) type
-                     [(fp-ftd& ,ftd) (> ($ftd-size ftd) 16)]
+                     [(fp-ftd& ,ftd ,fptd) (> ($ftd-size ftd) 16)]
                      [else #f]))
 
     ;; result only meaningful if not `(result-via-pointer-argument? type)`
@@ -2107,7 +2121,7 @@
                                                                     [(int) (use-int-reg (load-single-into-int-reg reg))]
                                                                     [else (use-stack (load-single-stack isp))])]
                                                                  ;; need to move the aggregate data into regs or onto the stack
-                                                                 [(fp-ftd& ,ftd)
+                                                                 [(fp-ftd& ,ftd ,fptd)
                                                                   (case (cat-place cat)
                                                                     [(fp)
                                                                      ;; must be 1 register
@@ -2193,15 +2207,29 @@
                                                                  (reg-to-memory %Carg3 (cadr offsets) (cadr sizes) r2))))]
                                                         [else ($oops 'assembler-internal "unexpected result place")])))]
                                          [else e]))]
-                                     [add-deactivate
-                                      (lambda (adjust-active? t0 live* result-live* k)
+                                     [add-deactivate/errno
+                                      (lambda (adjust-active? maybe-errno-lvalue t0 live* result-live* k)
                                         (cond
                                          [adjust-active?
                                           (%seq
                                            (set! ,%ac0 ,t0)
                                            ,(save-and-restore live* (%inline deactivate-thread))
                                            ,(k %ac0)
-                                           ,(save-and-restore result-live* `(set! ,%Cretval ,(%inline activate-thread))))]
+                                           ,(save-and-restore result-live* (let ([e `(set! ,%Cretval ,(%inline activate-thread))])
+                                                                             (cond
+                                                                               [maybe-errno-lvalue
+                                                                                (%seq
+                                                                                 (set! ,%Cretval ,(%inline save-errno))
+                                                                                 ,(save-and-restore (list %Cretval) e)
+                                                                                 (set! ,maybe-errno-lvalue ,%Cretval))]
+                                                                               [else e]))))]
+                                         [maybe-errno-lvalue
+                                          (%seq
+                                           ,(k t0)
+                                           ,(save-and-restore result-live*
+                                                              (%seq
+                                                               (set! ,%Cretval ,(%inline save-errno))
+                                                               (set! ,maybe-errno-lvalue ,%Cretval))))]
                                          [else (k t0)]))])
                               (define returnem
                                 (lambda (frame-size locs ccall r-loc)
@@ -2226,7 +2254,7 @@
                                        [arg-type* (info-foreign-arg-type* info)]
                                        [result-type (info-foreign-result-type info)]
                                        [ftd-result? (nanopass-case (Ltype Type) result-type
-                                                                   [(fp-ftd& ,ftd) #t]
+                                                                   [(fp-ftd& ,ftd ,fptd) #t]
                                                                    [else #f])]
                                        [pass-result-ptr? (result-via-pointer-argument? result-type)]
                                        [arg-type* (if (and ftd-result?
@@ -2246,7 +2274,7 @@
                                                   ;; stash extra argument on the stack to be retrieved after call and filled with the result:
                                                   (cons (load-int-stack frame-size) locs)]
                                                  [else locs])
-                                                (lambda (t0 not-varargs?)
+                                                (lambda (t0 not-varargs? maybe-errno-lvalue)
                                                   (let* ([cat (categorize-result result-type)]
                                                          [result-reg* (if pass-result-ptr?
                                                                           '()
@@ -2258,9 +2286,10 @@
                                                      ;;@ so don't use that. BUT, we still have to store the retval in regs into
                                                      ;;@ the place pointed to by the pointer.
                                                      (and ftd-result? (not pass-result-ptr?)) cat frame-size
-                                                     (add-deactivate adjust-active? t0 live* result-reg*
-                                                                     (lambda (t0)
-                                                                       `(inline ,(make-info-kill*-live* (add-caller-save-registers result-reg*) live*) ,%c-call ,t0))))))
+                                                     (add-deactivate/errno
+                                                      adjust-active? maybe-errno-lvalue t0 live* result-reg*
+                                                      (lambda (t0)
+                                                        `(inline ,(make-info-kill*-live* (add-caller-save-registers result-reg*) live*) ,%c-call ,t0))))))
                                                 (nanopass-case (Ltype Type) result-type
                                                                ;;@ TODO check the two
                                                                [(fp-double-float)
@@ -2387,7 +2416,7 @@
                                                           (case (cat-place cat)
                                                             [(fp int) (use-reg (load-single-stack reg-offset))]
                                                             [else (use-stack (load-single-stack stack-arg-offset))])]
-                                                         [(fp-ftd& ,ftd)
+                                                         [(fp-ftd& ,ftd ,fptd)
                                                           (cond
                                                            [(cat-by-reference cat)
                                                             ;; register or stack contains pointer to data; we
@@ -2454,7 +2483,7 @@
                                                              ,(%inline double->single ,(%mref ,rhs ,%zero ,(constant flonum-data-disp) fp))))]
                                                    [(fp-void)
                                                     (lambda () `(nop))]
-                                                   [(fp-ftd& ,ftd)
+                                                   [(fp-ftd& ,ftd ,fptd)
                                                     (cond
                                                      [(not synthesize-first?)
                                                       ;; we passed the pointer to be filled, so nothing more to do here
@@ -2508,7 +2537,7 @@
                                                             '()
                                                             (cat-regs result-cat))]
                                            [ftd-result? (nanopass-case (Ltype Type) result-type
-                                                                       [(fp-ftd& ,ftd) #t]
+                                                                       [(fp-ftd& ,ftd ,fptd) #t]
                                                                        [else #f])]
                                            ;;@ size < 16, not passed as ptr, need to synthesize the result in return register(s)
                                            [synthesize-first? (and ftd-result?

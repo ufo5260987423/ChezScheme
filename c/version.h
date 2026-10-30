@@ -61,6 +61,10 @@
 # define BIG_ENDIAN_IEEE_DOUBLE
 #endif
 
+#if defined(__arm64__) && defined(__clang__) && (__clang_major__ == 15) && defined(__apple_build_version__)
+# define USE_PAR_SWEEPERS_WORKAROUND
+#endif
+
 #ifdef PORTABLE_BYTECODE
 # undef FLUSHCACHE
 # ifdef PORTABLE_BYTECODE_BIGENDIAN
@@ -105,7 +109,6 @@ FORCEINLINE void store_unaligned_uptr(uptr *addr, uptr val) {
 #define MMAP_HEAP
 #define IEEE_DOUBLE
 #define LDEXP
-#define ARCHYPERBOLIC
 #define GETPAGESIZE() getpagesize()
 typedef char *memcpy_t;
 #define MAKE_NAN(x) { x = 0.0; x = x / x; }
@@ -137,6 +140,35 @@ typedef int tputsputcchar;
 #endif
 #endif
 
+#if  defined(__HAIKU__)
+#define NOBLOCK O_NONBLOCK
+#define LOAD_SHARED_OBJECT
+#define USE_MMAP
+#define MMAP_HEAP
+#define IEEE_DOUBLE
+#define LDEXP
+#define GETPAGESIZE() getpagesize()
+typedef char *memcpy_t;
+#define MAKE_NAN(x) { x = 0.0; x = x / x; }
+#define GETWD(x) getcwd((x),PATH_MAX)
+typedef int tputsputcchar;
+#define LOCKF
+#define DIRMARKERP(c) ((c) == '/')
+#ifndef DISABLE_X11
+#define LIBX11 "libX11.so"
+#endif
+#define SECATIME(sb) (sb).st_atime
+#define SECCTIME(sb) (sb).st_ctime
+#define SECMTIME(sb) (sb).st_mtime
+#define NSECATIME(sb) 0
+#define NSECCTIME(sb) 0
+#define NSECMTIME(sb) 0
+#define ICONV_INBUF_TYPE char **
+#define USE_OSSP_UUID
+#endif
+
+
+
 #if defined(__FreeBSD__) || defined(__FreeBSD_kernel__) || defined(__DragonFly__)
 #define NOBLOCK O_NONBLOCK
 #define LOAD_SHARED_OBJECT
@@ -144,7 +176,6 @@ typedef int tputsputcchar;
 #define MMAP_HEAP
 #define IEEE_DOUBLE
 #define LDEXP
-#define ARCHYPERBOLIC
 #define GETPAGESIZE() getpagesize()
 typedef char *memcpy_t;
 #define MAKE_NAN(x) { x = 0.0; x = x / x; }
@@ -175,7 +206,6 @@ typedef int tputsputcchar;
 #define MMAP_HEAP
 #define IEEE_DOUBLE
 #define LDEXP
-#define ARCHYPERBOLIC
 #define GETPAGESIZE() getpagesize()
 typedef char *memcpy_t;
 struct timespec;
@@ -206,7 +236,6 @@ typedef int tputsputcchar;
 #define USE_VIRTUAL_ALLOC
 #define NAN_INCLUDE <math.h>
 #define MAKE_NAN(x) { x = sqrt(-1.0); }
-#define ARCHYPERBOLIC
 #ifndef PATH_MAX
 # define PATH_MAX _MAX_PATH
 #endif
@@ -277,7 +306,6 @@ struct timespec;
 #define MMAP_HEAP
 #define IEEE_DOUBLE
 #define LDEXP
-#define ARCHYPERBOLIC
 #define GETPAGESIZE() getpagesize()
 typedef char *memcpy_t;
 struct timespec;
@@ -307,9 +335,10 @@ typedef int tputsputcchar;
 #define MMAP_HEAP
 #define IEEE_DOUBLE
 /* for both iPhone and iPhoneSimulator */
-#if defined(TARGET_OS_IPHONE)
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
 # define SYSTEM(s) ((void)s, -1)
 # define WRITE_XOR_EXECUTE_CODE
+# define S_TARGET_OS_IPHONE
 #endif
 #if defined(__arm64__)
 # if !defined(WRITE_XOR_EXECUTE_CODE)
@@ -323,7 +352,6 @@ typedef int tputsputcchar;
 # define CANNOT_READ_DIRECTLY_INTO_CODE
 #endif
 #define LDEXP
-#define ARCHYPERBOLIC
 #define GETPAGESIZE() getpagesize()
 typedef char *memcpy_t;
 #define MAKE_NAN(x) { x = 0.0; x = x / x; }
@@ -356,7 +384,6 @@ typedef int tputsputcchar;
 #define MMAP_HEAP
 #define IEEE_DOUBLE
 #define LDEXP
-#define ARCHYPERBOLIC
 #define GETPAGESIZE() getpagesize()
 typedef char *memcpy_t;
 #define MAKE_NAN(x) { x = 0.0; x = x / x; }
@@ -384,8 +411,6 @@ typedef int tputsputcchar;
 #define MMAP_HEAP
 #define IEEE_DOUBLE
 #define LDEXP
-#define ARCHYPERBOLIC
-#define LOG1P
 #define DEFINE_MATHERR
 #define NO_USELOCALE
 #define GETPAGESIZE() getpagesize()
@@ -414,7 +439,6 @@ typedef char tputsputcchar;
 #define NOBLOCK O_NONBLOCK
 #define IEEE_DOUBLE
 #define LDEXP
-#define ARCHYPERBOLIC
 typedef char *memcpy_t;
 #define MAKE_NAN(x) { x = 0.0; x = x / x; }
 #define GETWD(x) getcwd((x),PATH_MAX)

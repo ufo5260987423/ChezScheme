@@ -21,7 +21,7 @@
          preinfo-call-can-inline? preinfo-call-no-return? preinfo-call-single-valued?
          prelex? make-prelex prelex-name prelex-name-set! prelex-flags prelex-flags-set!
          prelex-source prelex-operand prelex-operand-set! prelex-uname make-prelex*
-         target-fixnum? target-bignum?)
+         target-fixnum? target-fixnum-power-of-two target-bignum?)
 
   (module (lookup-primref primref? primref-name primref-flags primref-arity primref-level)
     (include "primref.ss")
@@ -190,10 +190,10 @@
 
   ; language of foreign types
   (define-language Ltype 
-    (nongenerative-id #{Ltype czp82kxwe75y4e18-1})
+    (nongenerative-id #{Ltype czp82kxwe75y4e77-2})
     (terminals
       (exact-integer (bits))
-      ($ftd (ftd)))
+      ($ftd (ftd fptd)))
     (Type (t)
       (fp-integer bits)
       (fp-unsigned bits)
@@ -205,8 +205,8 @@
       (fp-fixnum)
       (fp-double-float)
       (fp-single-float)
-      (fp-ftd ftd)
-      (fp-ftd& ftd)))
+      (fp-ftd ftd)          ; `ftd` is rtd for a pointer record
+      (fp-ftd& ftd1 ftd2))) ; `ftd1` describes passed value; `ftd2` is for a pointer record
 
   (define arity?
     (lambda (x)

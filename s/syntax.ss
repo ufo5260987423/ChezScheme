@@ -665,7 +665,7 @@
               [else
                (cond
                 [($ftd? x) `(fp-ftd ,x)]
-                [($ftd-as-box? x) `(fp-ftd& ,(unbox x))]
+                [($ftd-pair? x) `(fp-ftd& ,(car x) ,(cdr x))]
                 [else #f])])
             ($oops #f "invalid ~a ~a specifier ~s" who what x)))))
 
@@ -4787,7 +4787,7 @@
              e1 e2 ...)]))
       (define make-path
         (lambda (dir rpath ext)
-          (if (or (string=? dir "") (string=? dir "."))
+          (if (string=? dir ".")
               (format "~a~a" rpath ext)
               (path-build dir (format "~a~a" rpath ext)))))
       (let ([rpath (fold-left (lambda (dir elem) (path-build dir (symbol->string elem))) (symbol->string (car path)) (cdr path))])
@@ -8358,18 +8358,19 @@
                              (set! y t) ...))])
                (dynamic-wind #t swap (lambda () e1 e2 ...) swap))))])))
 
-
 (define-syntax with-continuation-mark
   (lambda (x)
     (syntax-case x ()
       [(_ key val body)
-       #'($call-consuming-continuation-attachment
-          '()
-          (lambda (marks)
-            ($call-setting-continuation-attachment
-             ($update-mark marks key val)
-             (lambda ()
-               body))))])))
+       #'(let ([k key]
+               [v val])
+           ($call-consuming-continuation-attachment
+            '()
+            (lambda (marks)
+              ($call-setting-continuation-attachment
+               ($update-mark marks k v)
+               (lambda ()
+                 body)))))])))
 
 (define-syntax rec
   (lambda (x)
@@ -8876,7 +8877,7 @@
               ($syntax-match? (cdr pat) (cdr exp)))]))))
 
 (define $fp-filter-type
-  (lambda (type void-okay?)
+  (lambda (type as-result?)
    ; not the same as cmacros filter-type, which allows things like bigit
     (case type
       [(scheme-object double-float single-float
@@ -8885,7 +8886,7 @@
         integer-56 unsigned-56 integer-64 unsigned-64
         boolean stdbool fixnum char wchar u8* u16* u32* utf-8 utf-16le utf-16be utf-16
         utf-32le utf-32be utf-32) type]
-      [(void) (and void-okay? type)]
+      [(void) (and as-result? type)]
       [(ptr) 'scheme-object]
       [(iptr)
        (constant-case ptr-bits
@@ -8958,7 +8959,7 @@
             [(big) 'utf-32be]
             [(unknown) 'utf-32])])]
       [else
-       (and (or ($ftd? type) ($ftd-as-box? type))
+       (and (or ($ftd? type) ($ftd-pair? type))
             type)])))
 
 (define $fp-type->pred
@@ -8995,7 +8996,15 @@
           (syntax-error orig-c (format "invalid ~s convention with ~a arguments" who num-args)))))
     (let loop ([conv* conv*] [selected #f] [accum '()] [keep-accum '()])
       (cond
-        [(null? conv*) (datum->syntax #'filter-conv keep-accum)]
+        [(null? conv*)
+         (let ([keep-accum (if (or (memq 'save-errno keep-accum)
+                                   (memq 'save-last-error keep-accum))
+                               ;; Although `__atomic` is not inherently incompatible
+                               ;; with `__errno`, compilation treats `__atomic` as
+                               ;; implying single-valued
+                               (remq 'atomic keep-accum)
+                               keep-accum)])
+           keep-accum)]
         [else
          (let* ([orig-c (car conv*)]
                 [c (syntax->datum orig-c)])
@@ -9003,6 +9012,13 @@
                          (cond
                            [(not c) (values #f #f)]
                            [(eq? c '__collect_safe) (values 'adjust-active #f)]
+                           [(eq? c '__errno) (values 'save-errno #f)]
+                           [(and (eq? c '__get_last_error)
+                                 (memq ($target-machine) '(i3nt ti3nt a6nt ta6nt arm64nt tarm64nt)))
+                            (values 'save-last-error #f)]
+                           [(eq? c '__atomic) (values 'atomic #f)]
+                           [(eq? c '__alloc) (values 'alloc #f)]
+                           [(eq? c '__disable_interrupts) (values 'disable-interrupts #f)]
                            [(eq? c '__varargs)
                             (check-arg-count 1 orig-c)
                             (values (cons 'varargs 1) #f)]
@@ -9032,8 +9048,15 @@
              (when (or (member c accum)
                        (and (pair? c) (ormap pair? accum)))
                (syntax-error orig-c (format "redundant ~s convention" who)))
-             (when (and select? selected)
+             (when (or (and select? selected)
+                       (and (eq? c 'atomic) (memq 'adjust-active keep-accum))
+                       (and (eq? c 'adjust-active) (memq 'atomic keep-accum))
+                       (and (eq? c 'save-errno) (memq 'save-last-error keep-accum))
+                       (and (eq? c 'save-last-error) (memq 'save-errno keep-accum)))
                (syntax-error orig-c (format "conflicting ~s convention" who)))
+             (when (and (eq? c 'alloc)
+                        (not (memq 'atomic keep-accum)))
+               (syntax-error orig-c (format "missing __atomic before ~s convention" who)))
              (loop (cdr conv*) (if select? c selected) (cons c accum)
                    (if c
                        (cons c keep-accum)
@@ -9041,16 +9064,17 @@
 
 (define $make-foreign-procedure
   (lambda (who conv* foreign-name ?foreign-addr type* result-type)
-    (let ([unsafe? (= (optimize-level) 3)])
+    (let ([unsafe? (= (optimize-level) 3)]
+          [disable-interrupts? (memq 'disable-interrupts conv*)])
       (define (check-strings-allowed)
-        (when (memq 'adjust-active (syntax->datum conv*))
+        (when (memq 'adjust-active conv*)
           ($oops who "string argument not allowed with __collect_safe procedure")))
       (define (check-floats-allowed pos)
         (let ([va-n (ormap (lambda (conv) (and (pair? conv) (eq? (car conv) 'varargs) (cdr conv)))
-                           (syntax->datum conv*))])
+                           conv*)])
           (when (and va-n (>= pos va-n))
             ($oops who "single-float varargs argument not allowed"))))
-      (with-syntax ([conv* conv*]
+      (with-syntax ([(conv ...) (datum->syntax #'conv conv*)]
                     [foreign-name foreign-name]
                     [?foreign-addr ?foreign-addr]
                     [(t ...) (generate-temporaries type*)])
@@ -9177,9 +9201,9 @@
                                     (check-floats-allowed pos)
                                     #f]
                                    [else #f])
-                                 (if (or ($ftd? type) ($ftd-as-box? type))
-                                     (let ([ftd (if ($ftd? type) type (unbox type))])
-                                       #`(#,(if unsafe? #'() #`((unless (record? x '#,ftd) (err ($moi) x))))
+                                 (if (or ($ftd? type) ($ftd-pair? type))
+                                     (let ([ftd (if ($ftd? type) type (cdr type))])
+                                       #`(#,(if unsafe? #'() #`((unless (record? x '#,($ftd->predicate-rtd ftd)) (err ($moi) x))))
                                           (x)
                                           (#,type)))
                                      (with-syntax ([pred (datum->syntax #'foreign-procedure ($fp-type->pred type))]
@@ -9220,7 +9244,7 @@
                          [(unsigned-56) #`((lambda (x) (mod x #x100000000000000)) unsigned-64)]
                          [else
                           (cond
-                            [($ftd-as-box? result-type)
+                            [($ftd-pair? result-type)
                              ;; Return void, since an extra first argument receives the result,
                              ;; but tell `$foreign-procedure` that the result is actually an & form
                              #`((lambda (r) (void)) #,(datum->syntax #'foreign-procedure result-type))]
@@ -9233,21 +9257,42 @@
                        ;; explicit for `$foreign-procedure`, and the return type is preserved as-is
                        ;; to let `$foreign-procedure` know that it needs to fill the first argument.
                        (cond
-                         [($ftd-as-box? result-type)
+                         [($ftd-pair? result-type)
                           #`([&-result]
-                             [#,(unbox result-type)]
+                             [#,(cdr result-type)]
                              #,(if unsafe?
                                    #`[]
-                                   #`[(unless (record? &-result '#,(unbox result-type)) (err ($moi) &-result))]))]
+                                   #`[(unless (record? &-result '#,($ftd->predicate-rtd (cdr result-type))) (err ($moi) &-result))]))]
                          [else #'([] [] [])])])
-          #`(let ([p ($foreign-procedure conv* foreign-name ?foreign-addr (extra-arg ... arg ... ...) result)]
-                  #,@(if unsafe?
-                         #'()
-                         #'([err (lambda (who x)
-                                   ($oops (or who foreign-name)
-                                     "invalid foreign-procedure argument ~s"
-                                     x))])))
-              (lambda (extra ... t ...) extra-check ... check ... ... (result-filter (p extra ... actual ... ...)))))))))
+          (let ([wrap-result
+                 (with-syntax ([result-filter
+                                (if disable-interrupts?
+                                    #'(lambda (v)
+                                        (enable-interrupts)
+                                        (result-filter v))
+                                    #'result-filter)])
+                   (syntax-case #'result-filter (begin)
+                     [begin (lambda (call) call)]
+                     [_
+                      (cond
+                        [(or (memq 'save-errno conv*) (memq 'save-last-error conv*))
+                         (lambda (call)
+                           #`(let-values ([(v errno) #,call])
+                               (values (result-filter v) errno)))]
+                        [else
+                         (lambda (call) #`(result-filter #,call))])]))])
+            #`(let ([foreign-addr ?foreign-addr]
+                    #,@(if unsafe?
+                           #'()
+                           #'([err (lambda (who x)
+                                     ($oops (or who foreign-name)
+                                            "invalid foreign-procedure argument ~s"
+                                            x))])))
+                (let ([p ($foreign-procedure (conv ...) foreign-name foreign-addr (extra-arg ... arg ... ...) result)])
+                  (lambda (extra ... t ...)
+                    extra-check ... check ... ...
+                    #,@(if disable-interrupts? (list #'(disable-interrupts)) '())
+                    #,(wrap-result #`(p extra ... actual ... ...)))))))))))
 
 (define-syntax foreign-procedure
   (lambda (x)
@@ -9271,17 +9316,17 @@
     (for-each (lambda (c)
                 (when (eq? (syntax->datum c) 'i3nt-com)
                   ($oops who "unsupported convention ~s" c)))
-              (syntax->list conv*))
+              conv*)
     (let ([unsafe? (= (optimize-level) 3)])
       (define (check-strings-allowed)
-        (when (memq 'adjust-active (syntax->datum conv*))
+        (when (memq 'adjust-active conv*)
           ($oops who "string result not allowed with __collect_safe callable")))
       (define (check-floats-allowed pos)
         (let ([va-n (ormap (lambda (conv) (and (pair? conv) (eq? (car conv) 'varargs) (cdr conv)))
-                           (syntax->datum conv*))])
+                           conv*)])
           (when (and va-n (>= pos va-n))
             ($oops who "single-float argument not allowed for __varargs procedure"))))
-      (with-syntax ([conv* conv*] [?proc ?proc])
+      (with-syntax ([(conv ...) (datum->syntax #'conv conv*)] [?proc ?proc])
         (with-syntax ([((actual (t ...) (arg ...)) ...)
                        (map
                         (lambda (type pos)
@@ -9520,19 +9565,20 @@
                          [else
                           (cond
                             [($ftd? result-type)
-                             (with-syntax ([type (datum->syntax #'foreign-callable result-type)])
+                             (with-syntax ([pred-type (datum->syntax #'foreign-callable ($ftd->predicate-rtd result-type))]
+                                           [type (datum->syntax #'foreign-callable result-type)])
                                #`((lambda (x)
-                                    #,@(if unsafe? #'() #'((unless (record? x 'type) (err x))))
+                                    #,@(if unsafe? #'() #'((unless (record? x 'pred-type) (err x))))
                                     x)
                                   type
                                   [] []))]
-                            [($ftd-as-box? result-type)
+                            [($ftd-pair? result-type)
                              ;; callable receives an extra pointer argument to fill with the result;
                              ;; we add this type to `$foreign-callable` as an initial address argument,
                              ;; which may be actually provided by the caller or synthesized by the
                              ;; back end, depending on the type and architecture
                              (with-syntax ([type (datum->syntax #'foreign-callable result-type)]
-                                           [ftd (datum->syntax #'foreign-callable (unbox result-type))])
+                                           [ftd (datum->syntax #'foreign-callable (cdr result-type))])
                                #`((lambda (x) (void)) ; callable result is ignored
                                   type
                                   [ftd]
@@ -9547,7 +9593,7 @@
                                   [] []))])])])
           ; use a gensym to avoid giving the procedure a confusing name
           (with-syntax ([p (datum->syntax #'foreign-callable (gensym))])
-            #`($foreign-callable conv*
+            #`($foreign-callable (conv ...)
                 (let ([p ?proc])
                   (define (err x)
                     ($oops 'foreign-callable
@@ -9555,6 +9601,8 @@
                       x p))
                   #,@(if unsafe? #'() #'((unless (procedure? p) ($oops 'foreign-callable "~s is not a procedure" p))))
                   (lambda (extra ... t ... ...)
+                    ;; note: interrupt disabling is handled in cpnanopass, because it needs
+                    ;; to be close enough to the back end to apply even for interpret mode
                     ($event-trap-check) ; ensure eventual `($event)` in the case of many short callbacks
                     (result-filter (p extra ... actual ...))))
                 (extra-arg ... arg ... ...)

@@ -148,6 +148,50 @@
         ($oops who "~s is not a valid index for ~s" idx v))
       (#3%immutable-vector-set/copy v idx val))))
 
+(set-who!
+ vector-copy!
+ (lambda (v1 i1 v2 i2 k)
+   (unless (vector? v1)
+     ($oops who "~s is not an vector" v1))
+   (unless (vector? v2)
+     ($oops who "~s is not an vector" v2))
+   (let ([n1 (vector-length v1)] [n2 (vector-length v2)]
+         [src v1] [tgt v2] [src-start i1] [tgt-start i2])
+     (unless (and (fixnum? i1) (fx>= i1 0))
+       ($oops who "invalid start value ~s" i1))
+     (unless (and (fixnum? i2) (fx>= i2 0))
+       ($oops who "invalid start value ~s" i2))
+     (unless (and (fixnum? k) (fx>= k 0))
+       ($oops who "invalid count ~s" k))
+     (unless (fx<= k (fx- n1 i1)) ; avoid overflow
+       ($oops who "index ~s + count ~s is beyond the end of ~s" i1 k v1))
+     (unless (fx<= k (fx- n2 i2)) ; avoid overflow
+       ($oops who "index ~s + count ~s is beyond the end of ~s" i2 k v2))
+     (if (eq? src tgt)
+         (let ([src-end (fx+ src-start k)] [tgt-end (fx+ tgt-start k)])
+           (cond
+            [(or
+              ;; disjoint, left to right
+              (fx<= src-end tgt-start)
+              ;; disjoint, right to left
+              (fx<= tgt-end src-start)
+              ;; overlapping, right to left
+              (fx<= tgt-start src-start))
+             (let loop ([i src-start] [j tgt-start] [k k])
+               (unless (fx= k 0)
+                 (vector-set! tgt j (vector-ref src i))
+                 (loop (fx1+ i) (fx1+ j) (fx1- k))))]
+            [(fx< src-start tgt-start)
+             ;; overlapping, left to right, copy from last to first
+             (let loop ([i (fx1- src-end)] [j (fx1- tgt-end)] [k k])
+               (unless (fx= k 0)
+                 (vector-set! tgt j (vector-ref src i))
+                 (loop (fx1- i) (fx1- j) (fx1- k))))]))
+         (let loop ([i src-start] [j tgt-start] [k k])
+           (unless (fx= k 0)
+             (vector-set! tgt j (vector-ref src i))
+             (loop (fx1+ i) (fx1+ j) (fx1- k))))))))
+
 (set! vector->list
   (lambda (v)
     (unless (vector? v)
@@ -210,6 +254,30 @@
               (constant fxvector-data-disp) n))
         fxv2))))
 
+(set-who!
+ fxvector-copy!
+ (lambda (fxv1 i1 fxv2 i2 k)
+   (unless (fxvector? fxv1)
+     ($oops who "~s is not an fxvector" fxv1))
+   (unless (fxvector? fxv2)
+     ($oops who "~s is not an fxvector" fxv2))
+   (let ([n1 (fxvector-length fxv1)] [n2 (fxvector-length fxv2)])
+     (unless (and (fixnum? i1) (fx>= i1 0))
+       ($oops who "invalid start value ~s" i1))
+     (unless (and (fixnum? i2) (fx>= i2 0))
+       ($oops who "invalid start value ~s" i2))
+     (unless (and (fixnum? k) (fx>= k 0))
+       ($oops who "invalid count ~s" k))
+     (unless (fx<= k (fx- n1 i1)) ; avoid overflow
+       ($oops who "index ~s + count ~s is beyond the end of ~s" i1 k fxv1))
+     (unless (fx<= k (fx- n2 i2)) ; avoid overflow
+       ($oops who "index ~s + count ~s is beyond the end of ~s" i2 k fxv2))
+     ($ptr-copy! fxv1 (+ (constant fxvector-data-disp)
+                           (* (constant ptr-bytes) i1))
+                 fxv2 (+ (constant fxvector-data-disp)
+                           (* (constant ptr-bytes) i2))
+                 k))))
+
 (set! flvector->list
   (lambda (v)
     (unless (flvector? v)
@@ -248,6 +316,30 @@
             ($byte-copy! flv1 (constant flvector-data-disp) flv2
               (constant flvector-data-disp) (fx* n (constant flonum-bytes))))
         flv2))))
+
+(set-who!
+ flvector-copy!
+ (lambda (flv1 i1 flv2 i2 k)
+   (unless (flvector? flv1)
+     ($oops who "~s is not an flvector" flv1))
+   (unless (flvector? flv2)
+     ($oops who "~s is not an flvector" flv2))
+   (let ([n1 (flvector-length flv1)] [n2 (flvector-length flv2)])
+     (unless (and (fixnum? i1) (fx>= i1 0))
+       ($oops who "invalid start value ~s" i1))
+     (unless (and (fixnum? i2) (fx>= i2 0))
+       ($oops who "invalid start value ~s" i2))
+     (unless (and (fixnum? k) (fx>= k 0))
+       ($oops who "invalid count ~s" k))
+     (unless (fx<= k (fx- n1 i1)) ; avoid overflow
+       ($oops who "index ~s + count ~s is beyond the end of ~s" i1 k flv1))
+     (unless (fx<= k (fx- n2 i2)) ; avoid overflow
+       ($oops who "index ~s + count ~s is beyond the end of ~s" i2 k flv2))
+     ($byte-copy! flv1 (+ (constant flvector-data-disp)
+                          (* (constant flonum-bytes) i1))
+                  flv2 (+ (constant flvector-data-disp)
+                          (* (constant flonum-bytes) i2))
+                  (* k (constant flonum-bytes))))))
 
 (set! vector-map
   (case-lambda

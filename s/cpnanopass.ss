@@ -724,7 +724,8 @@
                                  (and (preinfo-call-no-return? preinfo) (not (preinfo-call-check? preinfo))))
             ,(Expr e) ,e* ...)]
         [(foreign (,conv* ...) ,name ,[e] (,arg-type* ...) ,result-type)
-         (let ([info (make-info-foreign conv* arg-type* result-type #f)])
+         (let* ([unbox-args? (memq 'atomic conv*)]
+                [info (make-info-foreign conv* arg-type* result-type unbox-args?)])
            (info-foreign-name-set! info name)
            `(foreign ,info ,e))]
         [(fcallable (,conv* ...) ,[e] (,arg-type* ...) ,result-type)
@@ -1029,7 +1030,17 @@
 
     (define-pass np-expand-foreign : L4.5 (ir) -> L4.75 ()
       (Expr : Expr (ir) -> Expr ()
+        [(call ,info1 ,mdcl (foreign ,info ,[e]) ,[e*] ...)
+         (guard (memq 'atomic (info-foreign-conv* info)))
+         (safe-assert (not (or (memq 'save-errno (info-foreign-conv* info))
+                               (memq 'save-last-error (info-foreign-conv* info)))))
+         ;; convert atomic calls directly to `foreign-call`
+         `(foreign-call ,info ,e ,e* ...)]
         [(foreign ,info ,[e])
+         ;; non-atomic calls to go through a function generated here, because during a
+         ;; foreign call, there's no Scheme-level return address to know the
+         ;; caller's frame, so there must be no live variables in the frame; a
+         ;; potential improvement would be to convert to `foreign-call` when in tail position
          (let ([iface (length (info-foreign-arg-type* info))]
                [t (make-tmp 'tentry 'uptr)]
                [t* (map (lambda (x) (make-tmp 't)) (info-foreign-arg-type* info))])
@@ -1042,77 +1053,158 @@
          (%primcall #f #f $instantiate-code-object
            (fcallable ,info)
            (quote 0) ; hard-wiring "cookie" to 0
-           ,e)]))
+           ,(if (memq 'disable-interrupts (info-foreign-conv* info))
+                ;; need to build a wrapper procedure that does not have interrupt traps,
+                ;; so we can disable interrupts early enough and reenabled them late enough
+                (let* ([p (make-tmp 'proc)]
+                       [r (make-tmp 'result)]
+                       [interface (length (info-foreign-arg-type* info))]
+                       [x* (map (lambda (x) (make-tmp 'x)) (info-foreign-arg-type* info))]
+                       [lambda-info (make-info-lambda #f #f #f (list interface) #f (constant code-flag-no-interrupt-trap))])
+                   `(let ([,p ,e])
+                      (case-lambda ,lambda-info
+                        (clause (,x* ...) ,interface
+                          (seq
+                           (call ,(make-info-call #f #f #f #f #f) #f ,(lookup-primref 2 'disable-interrupts))
+                           (let ([,r (call ,(make-info-call #f #f #f #f #f) #f ,p ,x* ...)])
+                             (seq
+                              (call ,(make-info-call #f #f #f #f #f) #f ,(lookup-primref 2 '$enable-interrupts/no-event))
+                              ,r)))))))
+                ;; no extra wrapper needed
+                e))]))
 
-    (define-pass np-recognize-loops : L4.75 (ir) -> L4.875 ()
-      ; TODO: also recognize andmap/for-all, ormap/exists, for-each
-      ;       and remove inline handlers
+    (define-pass np-recognize-loops : L4.75 (ir) -> L4.75 ()
+      ;; Sets the `loop` flag on uvars, where a loop uvar is bound to
+      ;; a function that calls itself only in tail position, and there's
+      ;; one other call from outside, all with the right number of arguments.
+      ;; Rely on `cpletrec` to break up `letrec`s into SCCs, so a loop
+      ;; candidate will be by itself in its own `letrec`.
+      (Expr : Expr (ir tail*) -> * ()
+        [,x (uvar-loop! x #f)]
+        [(letrec ([,x1 (case-lambda ,info1
+                         (clause (,x* ...) ,interface
+                           ,body))])
+           ,e)
+         (uvar-loop! x1 #t)
+         (uvar-maybe-loop-entry! x1 #t)
+         (uvar-applied-once! x1 #f)
+         (Expr e tail*)
+         (uvar-maybe-loop-entry! x1 #f)
+         (Expr body (list x1))]
+        [(letrec ([,x* ,[Expr : le* '() -> le*]] ...) ,[Expr : body tail* -> body]) (void)]
+        [(call ,info ,mdcl ,x1 ,[Expr : e* '() -> e*] ...)
+         (cond
+           [(uvar-maybe-loop-entry? x1)
+            (cond
+              [(or (uvar-applied-once? x1)
+                   (not (let ([interface* (info-lambda-interface* (uvar-info-lambda x1))])
+                          (and (fx= (length interface*) 1) (fx= (length e*) (car interface*))))))
+               (uvar-applied-once! x1 #f)
+               (uvar-loop! x1 #f)]
+              [else
+               (uvar-applied-once! x1 #t)])]
+           [(uvar-loop? x1)
+            (cond
+              [(memq x1 tail*)
+               (let ([interface* (info-lambda-interface* (uvar-info-lambda x1))])
+                 (unless (and (fx= (length interface*) 1) (fx= (length e*) (car interface*)))
+                   (uvar-loop! x1 #f)))]
+              [else
+               (uvar-loop! x1 #f)])])]
+        [(call ,info ,mdcl ,[Expr : e '() -> e] ,[Expr : e* '() -> e*] ...) (void)]
+        [(foreign-call ,info ,[Expr : e '() -> e] ,[Expr : e* '() -> e*] ...) (void)]
+        [(fcallable ,info) (void)]
+        [(label ,l ,[Expr : body tail* -> body]) (void)]
+        [(mvlet ,[Expr : e '() -> e] ((,x** ...) ,interface* ,[Expr : body* tail* -> body*]) ...) (void)]
+        [(mvcall ,info ,[Expr : e1 '() -> e1] ,[Expr : e2 '() -> e2]) (void)]
+        [(let ([,x ,[Expr : e* '() -> e*]] ...) ,[Expr : body tail* -> body]) (void)]
+        [(case-lambda ,info ,[CaseLambdaClause : cl] ...) (void)]
+        [(quote ,d) (void)]
+        [(if ,[Expr : e0 '() -> e0] ,[Expr : e1 tail* -> e1] ,[Expr : e2 tail* -> e2]) (void)]
+        [(seq ,[Expr : e0 '() -> e0] ,[Expr : e1 tail* -> e1]) (void)]
+        [(profile ,src) (void)]
+        [(pariah) (void)]
+        [,pr (void)]
+        [else ($oops who "unexpected Expr ~s" ir)])
+      (CaseLambdaClause : CaseLambdaClause (cl) -> * ()
+        [(clause (,x* ...) ,interface ,[Expr : body '() -> body]) (void)])
+      (CaseLambdaExpr : CaseLambdaExpr (ir) -> * ()
+        [(case-lambda ,info ,[CaseLambdaClause : cl] ...) (void)])
+      (begin (CaseLambdaExpr ir) ir))
+
+    (define-pass np-convert-loops : L4.75 (ir) -> L4.875 ()
+      ;; Moves each loop function to its unique call site and converts
+      ;; to the `loop` function.
+      ;; TODO: also recognize andmap/for-all, ormap/exists, for-each
+      ;;       and remove inline handlers
       (definitions
         (define make-assigned-tmp
           (lambda (x)
             (let ([t (make-tmp 'tloop)])
               (uvar-assigned! t #t)
               t))))
-      (Expr : Expr (ir [tail* '()]) -> Expr ()
-        [,x (uvar-referenced! x #t) (uvar-loop! x #f) x]
+      (Expr : Expr (ir to-enter) -> Expr ()
+        [,x x]
         [(letrec ([,x1 (case-lambda ,info1
                          (clause (,x* ...) ,interface
-                           ,body))])
-           (call ,info2 ,mdcl ,x2 ,e* ...))
-         (guard (eq? x2 x1) (eq? (length e*) interface))
+                                 ,body))])
+           ,e)
+         (guard (uvar-loop? x1))
          (uvar-referenced! x1 #f)
-         (uvar-loop! x1 #t)
-         (let ([tref?* (map uvar-referenced? tail*)])
-           (for-each (lambda (x) (uvar-referenced! x #f)) tail*)
-           (let ([e* (map (lambda (e) (Expr e '())) e*)]
-                 [body (Expr body (cons x1 tail*))])
-             (let ([body-tref?* (map uvar-referenced? tail*)])
-               (for-each (lambda (x tref?) (when tref? (uvar-referenced! x #t))) tail* tref?*)
-               (if (uvar-referenced? x1)
-                   (if (uvar-loop? x1)
-                       (let ([t* (map make-assigned-tmp x*)])
-                         `(let ([,t* ,e*] ...)
-                            (loop ,x1 (,t* ...)
-                              (let ([,x* ,t*] ...)
-                                ,body))))
-                       (begin
-                         (for-each (lambda (x body-tref?)
-                                     (when body-tref? (uvar-loop! x #f)))
-                           tail* body-tref?*)
-                         `(letrec ([,x1 (case-lambda ,info1
-                                          (clause (,x* ...) ,interface
-                                            ,body))])
-                            (call ,info2 ,mdcl ,x2 ,e* ...))))
-                   `(let ([,x* ,e*] ...) ,body)))))]
+         (let ([body (Expr body to-enter)])
+           (let ([used? (uvar-referenced? x1)])
+             (Expr e (cons (cons x1 (lambda (info2 mdcl e*)
+                                      (cond
+                                        [used?
+                                         (let ([t* (map make-assigned-tmp x*)])
+                                           `(let ([,t* ,e*] ...)
+                                              (loop ,x1 (,t* ...)
+                                                    (let ([,x* ,t*] ...)
+                                                      ,body))))]
+                                        [else
+                                         (uvar-referenced! x1 #f)
+                                         `(let ([,x* ,e*] ...)
+                                            ,body)])))
+                           to-enter))))]
         [(letrec ([,x* ,[le*]] ...) ,[body])
          `(letrec ([,x* ,le*] ...) ,body)]
-        [(call ,info ,mdcl ,x ,[e* '() -> e*] ...)
-         (guard (memq x tail*))
-         (uvar-referenced! x #t)
-         (let ([interface* (info-lambda-interface* (uvar-info-lambda x))])
-           (unless (and (fx= (length interface*) 1) (fx= (length e*) (car interface*)))
-             (uvar-loop! x #f)))
-         `(call ,info ,mdcl ,x ,e* ...)]
-        [(call ,info ,mdcl ,[e '() -> e] ,[e* '() -> e*] ...)
+        [(call ,info ,mdcl ,x ,e* ...)
+         (let ([e* (map (lambda (e) (Expr e to-enter)) e*)]
+               [p (assq x to-enter)])
+           (cond
+             [p ((cdr p) info mdcl e*)]
+             [else
+              (uvar-referenced! x #t)
+              (let ([x (Expr x to-enter)])
+                `(call ,info ,mdcl ,x ,e* ...))]))]
+        [(call ,info ,mdcl ,[e] ,[e*] ...)
          `(call ,info ,mdcl ,e ,e* ...)]
-        [(foreign-call ,info ,[e '() -> e] ,[e* '() -> e*] ...)
+        [(foreign-call ,info ,[e] ,[e*] ...)
          `(foreign-call ,info ,e ,e* ...)]
         [(fcallable ,info) `(fcallable ,info)]
         [(label ,l ,[body]) `(label ,l ,body)]
-        [(mvlet ,[e '() -> e] ((,x** ...) ,interface* ,[body*]) ...)
+        [(mvlet ,[e] ((,x** ...) ,interface* ,[body*]) ...)
          `(mvlet ,e ((,x** ...) ,interface* ,body*) ...)]
-        [(mvcall ,info ,[e1 '() -> e1] ,[e2 '() -> e2])
+        [(mvcall ,info ,[e1] ,[e2])
          `(mvcall ,info ,e1 ,e2)]
-        [(let ([,x ,[e* '() -> e*]] ...) ,[body])
+        [(let ([,x ,[e*]] ...) ,[body])
          `(let ([,x ,e*] ...) ,body)]
-        [(case-lambda ,info ,[cl] ...) `(case-lambda ,info ,cl ...)]
+        [(case-lambda ,info ,[CaseLambdaClause : cl to-enter -> cl] ...) `(case-lambda ,info ,cl ...)]
         [(quote ,d) `(quote ,d)]
-        [(if ,[e0 '() -> e0] ,[e1] ,[e2]) `(if ,e0 ,e1 ,e2)]
-        [(seq ,[e0 '() -> e0] ,[e1]) `(seq ,e0 ,e1)]
+        [(if ,[e0] ,[e1] ,[e2]) `(if ,e0 ,e1 ,e2)]
+        [(seq ,[e0] ,[e1])
+         `(seq ,e0 ,e1)]
         [(profile ,src) `(profile ,src)]
         [(pariah) `(pariah)]
         [,pr pr]
-        [else ($oops who "unexpected Expr ~s" ir)]))
+        [else ($oops who "unexpected Expr ~s" ir)])
+      (CaseLambdaClause : CaseLambdaClause (cl to-enter) -> CaseLambdaClause ()
+        [(clause (,x* ...) ,interface ,[Expr : body to-enter -> body])
+         `(clause (,x* ...) ,interface ,body)])
+      (CaseLambdaExpr : CaseLambdaExpr (ir to-enter) -> CaseLambdaExpr ()
+        [(case-lambda ,info ,[CaseLambdaClause : cl* to-enter -> cl*] ...)
+         `(case-lambda ,info ,cl* ...)])
+      (CaseLambdaExpr ir '()))
 
     (define-pass np-recognize-attachment : L4.875 (ir) -> L4.9375 ()
       (definitions
@@ -2370,7 +2462,7 @@
                                           (closure-seen! loc #t)
                                           (fx (cdr x*) free* (cons (closure-name loc) sibling*))
                                           (closure-seen! loc #f)))]
-                                   [else (sorry! who "unexpected uvar location ~s" loc)])))))))
+                                   [else (sorry! who "unexpected uvar location ~s ~s" loc x)])))))))
                  c*)
 
                ; find closures w/free variables (non-constant closures) and propagate
@@ -2496,10 +2588,11 @@
                    (build-fixnum? (cons x1 x*))]
                   [else `(if ,(build-fixnum? x*) ,(Expr e) (quote #f))]))))
           (define process-paired-predicate
-            (lambda (info1 pr1 pr2 x-arg)
-              (let ([pr1 (primref-name pr1)] [pr2 (primref-name pr2)])
+            (lambda (info1 prim1 prim2 x-arg)
+              (let ([pr1 (primref-name prim1)] [pr2 (primref-name prim2)])
                 (cond
-                  [(and (eq? pr1 'integer?) (eq? pr2 'exact?))
+                  [(or (and (eq? pr1 'integer?) (eq? pr2 'exact?))
+                       (and (eq? pr1 'exact?) (fx>= (primref-level prim1) 3) (eq? pr2 'integer?)))
                    `(if ,(%primcall #f #f fixnum? ,x-arg) (quote #t) ,(%primcall #f #f bignum? ,x-arg))]
                   [(and (eq? pr1 'port?) (eq? pr2 'binary-port?))
                    (%typed-object-check mask-binary-port type-binary-port ,x-arg)]
@@ -2846,12 +2939,20 @@
                        [else #f])))
          #t]
         [(call ,info ,mdcl ,pr ,[e1 #f -> * fp?1] ,[e2 #f -> * fp?2] ,e3)
-         (guard (eq? 'bytevector-ieee-double-native-set! (primref-name pr)))
+         (guard (memq (primref-name pr) '(bytevector-ieee-double-native-set! bytevector-ieee-single-native-set!)))
          (Expr e3 #t)
          #f]
         [(call ,info ,mdcl ,pr ,[e1 #f -> * fp?1] ,[e2 #f -> * fp?2] ,e3)
          (guard (eq? 'flvector-set! (primref-name pr)))
          (Expr e3 #t)
+         #f]
+        [(call ,info ,mdcl ,pr ,[e1 #f -> * fp?1] ,[e2 #f -> * fp?2] ,[e3 #f -> * fp?3] ,e4)
+         (guard (memq (primref-name pr) '($fptr-set-double-float! $fptr-set-single-float!)))
+         (Expr e4 #t)
+         #f]
+        [(call ,info ,mdcl ,pr ,e1 ,[e2 #f -> * fp?1] ,[e3 #f -> * fp?2])
+         (guard (eq? 'flbit-field (primref-name pr)))
+         (Expr e1 #t)
          #f]
         [(call ,info ,mdcl ,pr ,[e* #f -> * fp?] ...)
          (primref-flonum-result? pr)]
@@ -2896,7 +2997,15 @@
         [(attachment-consume ,reified ,[e #f -> * fp?]) #f]
         [(continuation-get) #f]
         [(continuation-set ,cop ,[e1 #f -> * fp?1] ,[e2 #f -> * fp?2]) #f]
-        [(foreign-call ,info ,[e #f -> * fp?] ,[e* #f -> * fp?*] ...) #f]
+        [(foreign-call ,info ,[e #f -> * fp?] ,e* ...)
+         (cond
+           [(equal? (length e*) (length (info-foreign-arg-type* info)))
+            (for-each (lambda (e arg-type) (Expr e (fp-type? arg-type)))
+                      e*
+                      (info-foreign-arg-type* info))]
+           [else
+            (for-each (lambda (e) (Expr e #f)) e*)])
+         (fp-type? (info-foreign-result-type info))]
         [(profile ,src) #f]
         [(raw ,e) #f]
         [(pariah) #f])
@@ -3078,29 +3187,33 @@
         [(raw ,[e #f -> e oc tc]) (values `(raw ,e) oc tc)]
         [(seq ,[e0 #f -> e0 oc0 tc0] ,[e1 oc1 tc1])
          (values `(seq ,e0 ,e1) (combine-seq oc0 oc1) (combine-seq tc0 tc1))])
-      (CaseLambdaClause : CaseLambdaClause (ir force-overflow?) -> CaseLambdaClause ()
+      (CaseLambdaClause : CaseLambdaClause (ir force-overflow? no-trap-check?) -> CaseLambdaClause ()
         [(clause (,x* ...) ,mcp ,interface ,body)
          (safe-assert (not repeat?)) ; should always be initialized and/or reset to #f
-         `(clause (,x* ...) ,mcp ,interface
-            ,(or (let f ()
-                   (let-values ([(body oc tc) (Expr body #t)])
-                     (if repeat?
-                         (begin (set! repeat? #f) (f))
-                         (strip-redundant-overflow-and-trap
-                           (let ([body (if (eq? tc 'yes) (add-trap-check #t body) body)])
-                             (if (or force-overflow? (eq? oc 'yes))
-                                 `(overflow-check ,body)
-                                 body))))))
-                 ; punting badly here under assumption that we currently can't even generate
-                 ; misbehaved gotos, i.e., paths ending in a goto that don't do an overflow
-                 ; or trap check where the target label expects it to have been done.  if we
-                 ; ever violate this assumption on a regular basis, might want to revisit and
-                 ; do something better.
-                 ; ... test punt case by commenting out above for all but library.ss
-                 `(overflow-check (trap-check #f ,(insert-loop-traps body)))))])
+         (fluid-let ([request-trap-check (if no-trap-check? 'no request-trap-check)])
+           `(clause (,x* ...) ,mcp ,interface
+              ,(or (let f ()
+                     (let-values ([(body oc tc) (Expr body #t)])
+                       (if repeat?
+                           (begin (set! repeat? #f) (f))
+                           (strip-redundant-overflow-and-trap
+                             (let ([body (if (eq? tc 'yes) (add-trap-check #t body) body)])
+                               (if (or force-overflow? (eq? oc 'yes))
+                                   `(overflow-check ,body)
+                                   body))))))
+                   ; punting badly here under assumption that we currently can't even generate
+                   ; misbehaved gotos, i.e., paths ending in a goto that don't do an overflow
+                   ; or trap check where the target label expects it to have been done.  if we
+                   ; ever violate this assumption on a regular basis, might want to revisit and
+                   ; do something better.
+                   ; ... test punt case by commenting out above for all but library.ss
+                   `(overflow-check (trap-check #f ,(insert-loop-traps body))))))])
       (CaseLambdaExpr : CaseLambdaExpr (ir) -> CaseLambdaExpr ()
         [(case-lambda ,info ,[cl* (let ([libspec (info-lambda-libspec info)])
-                                    (and libspec (libspec-does-not-expect-headroom? libspec))) -> cl*] ...)
+                                    (and libspec (libspec-does-not-expect-headroom? libspec)))
+                                  (fx= (bitwise-and (info-lambda-flags info) (constant code-flag-no-interrupt-trap))
+                                       (constant code-flag-no-interrupt-trap))
+                                  -> cl*] ...)
          `(case-lambda ,info ,cl* ...)]))
 
     (define-pass np-rebind-on-ruined-path : L9.5 (ir) -> L9.5 ()
@@ -4476,6 +4589,13 @@
                                    (with-output-language (L13 Rhs)
                                      (%mref ,x ,%zero ,(constant flonum-data-disp) fp))
                                    x))))))
+                (define build-fptr-ref
+                  (lambda ()
+                    (let ([x (make-tmp 't)])
+                      `(seq
+                        (set! ,x ,t)
+                        ,(toC (in-context Rhs
+                                (%mref ,x ,(constant record-data-disp))))))))
                 (nanopass-case (Ltype Type) type
                   [(fp-scheme-object) (toC t)]
                   [(fp-fixnum) (toC (build-unfix t))]
@@ -4486,13 +4606,8 @@
                   [(fp-unsigned ,bits) (ptr->integer bits t toC)]
                   [(fp-double-float) (build-float)]
                   [(fp-single-float) (build-float)]
-                  [(fp-ftd ,ftd)
-                   (let ([x (make-tmp 't)])
-                     `(seq
-                        (set! ,x ,t)
-                        ,(toC (in-context Rhs
-                                (%mref ,x ,(constant record-data-disp))))))]
-                  [(fp-ftd& ,ftd)
+                  [(fp-ftd ,ftd) (build-fptr-ref)]
+                  [(fp-ftd& ,ftd ,fptd)
                    (let ([x (make-tmp 't)])
                      (%seq
                       (set! ,x ,t)
@@ -4503,7 +4618,7 @@
               (lambda (type toC t)
                 (nanopass-case (Ltype Type) type
                   [(fp-void) (toC)]
-                  [(fp-ftd& ,ftd)
+                  [(fp-ftd& ,ftd ,fptd)
                    ;; pointer isn't received as a result, but instead passed
                    ;; to the function as its first argument (or simulated as such)
                    (toC)]
@@ -4577,14 +4692,24 @@
                                          (seq (label ,Lbig) ,e2)))))
                               (e1 e2))))))
                 (define (alloc-fptr ftd)
-                  (%seq
-                   (set! ,%xp
-                         ,(%constant-alloc type-typed-object (fx* (constant ptr-bytes) 2) #f))
-                   (set!
-                    ,(%mref ,%xp ,(constant record-type-disp))
-                    (literal ,(make-info-literal #f 'object ftd 0)))
-                   (set! ,(%mref ,%xp ,(constant record-data-disp)) ,%ac0)
-                   (set! ,lvalue ,%xp)))
+                  (let ([object? ($ftd-object? ftd)])
+                    (let ([mk
+                           (%seq
+                            (set! ,%xp
+                                  ,(%constant-alloc type-typed-object (fx* (constant ptr-bytes) (if object? 3 2)) #f))
+                            (set! ,(%mref ,%xp ,(constant record-type-disp))
+                                  (literal ,(make-info-literal #f 'object ftd 0)))
+                            (set! ,(%mref ,%xp ,(constant record-data-disp)) ,%ac0)
+                            ,(if object?
+                                 `(set! ,(%mref ,%xp ,(fx+ (constant record-data-disp) (constant ptr-bytes)))
+                                        (immediate ,(constant reference-disp)))
+                                 `(nop))
+                            (set! ,lvalue ,%xp))])
+                      (if object?
+                          `(if ,(%inline eq? ,%ac0 (immediate 0))
+                               (set! ,lvalue (literal ,(make-info-literal #f 'object ($fptr-null-pointer) 0)))
+                               ,mk)
+                          mk))))
                 (define (receive-fp)
                   (if is-unboxed?
                       (fromC lvalue)
@@ -4636,10 +4761,10 @@
                    (%seq
                     ,(fromC %ac0) ; C integer return might be wiped out by alloc
                     ,(alloc-fptr ftd))]
-                  [(fp-ftd& ,ftd)
+                  [(fp-ftd& ,ftd ,fptd)
                    (%seq
                     ,(fromC %ac0)
-                    ,(alloc-fptr ftd))]
+                    ,(alloc-fptr fptd))]
                   [else ($oops who "invalid result type specifier ~s" type)]))))
           (define (pick-Scall result-type)
             (nanopass-case (Ltype Type) result-type
@@ -4647,13 +4772,25 @@
               [else (lookup-c-entry Scall-one-result)]))
           (define build-foreign-call
             (with-output-language (L13 Effect)
-              (lambda (info t0 t1* maybe-lvalue new-frame?)
-                (let ([atomic? (memq 'atomic (info-foreign-conv* info))]) ;; 'atomic => no callables, not varargs
+              (lambda (info t0 t1* maybe-lvalue maybe-errno-lvalue new-frame?)
+                (let* ([atomic? (memq 'atomic (info-foreign-conv* info))] ;; 'atomic => no callables, varargs is precise
+                       [alloc? (and atomic? (memq 'alloc (info-foreign-conv* info)))])
+                  (safe-assert (or atomic? (not new-frame?)))
                   (let ([arg-type* (info-foreign-arg-type* info)]
                         [result-type (info-foreign-result-type info)]
                         [unboxed? (info-foreign-unboxed? info)]
                         [save-reg? (if atomic?
-                                       (lambda (reg) (not (reg-callee-save? reg)))
+                                       (lambda (reg) (or (not (reg-callee-save? reg))
+                                                         (and alloc?
+                                                              (or (meta-cond
+                                                                   [(real-register? '%ap) (eq? reg %ap)]
+                                                                   [else #f])
+                                                                  (meta-cond
+                                                                   [(real-register? '%eap) (eq? reg %eap)]
+                                                                   [else #f])
+                                                                  (meta-cond
+                                                                   [(real-register? '%trap) (eq? reg %trap)]
+                                                                   [else #f])))))
                                        (lambda (reg) #t))])
                     (let ([e (let-values ([(allocate c-args ccall c-res deallocate) (asm-foreign-call info)])
                               ; NB. allocate must save tc if not callee-save, and ccall
@@ -4665,26 +4802,22 @@
                                     ;; cp must hold our closure or our code object.  we choose code object
                                     `(set! ,(%tc-ref cp) (label-ref ,le-label 0)))
                                ,(with-saved-scheme-state
-                                 save-reg?
+                                  save-reg?
                                   (in) ; save just the required registers, e.g., %sfp
                                   (out %ac0 %ac1 %cp %xp %yp %ts %td scheme-args extra-regs)
                                   (fold-left (lambda (e t1 arg-type c-arg) `(seq ,(Scheme->C arg-type c-arg t1 #t unboxed?) ,e))
-                                    (ccall t0 atomic?) t1* arg-type* c-args))
+                                    (ccall t0 atomic? maybe-errno-lvalue) t1* arg-type* c-args))
                                ,(let ([e (deallocate)])
                                   (if maybe-lvalue
                                       (nanopass-case (Ltype Type) result-type
-                                        [(fp-ftd& ,ftd)
+                                        [(fp-ftd& ,ftd ,fptd)
                                          ;; Don't actually return a value, because the result
                                          ;; was instead installed in the first argument.
                                          `(seq (set! ,maybe-lvalue ,(%constant svoid)) ,e)]
                                         [else
                                          `(seq ,(C->Scheme result-type c-res maybe-lvalue #t unboxed? #t) ,e)])
                                       e))))])
-                    e
-                    #;
-                    (if new-frame?
-                        (sorry! who "can't handle nontail foreign calls")
-                        e)))))))
+                      e))))))
           (define build-fcallable
             (with-output-language (L13 Tail)
               (lambda (info self-label)
@@ -5456,9 +5589,11 @@
                  (restore-local-saves ,newframe-info)
                  (set! ,lvalue ,retval)))))]
         [(foreign-call ,info ,[t0] ,[t1*] ...)
-         (build-foreign-call info t0 t1* #f #t)]
+         (safe-assert (memq 'atomic (info-foreign-conv* info)))
+         (build-foreign-call info t0 t1* #f #f #t)]
         [(set! ,[lvalue] (foreign-call ,info ,[t0] ,[t1*] ...))
-         (build-foreign-call info t0 t1* lvalue #t)]
+         (safe-assert (memq 'atomic (info-foreign-conv* info)))
+         (build-foreign-call info t0 t1* lvalue #f #t)]
         [(set! ,[lvalue] (attachment-get ,reified? ,[t?]))
          (cond
           [(not t?)
@@ -5622,10 +5757,18 @@
         [(mvcall ,info ,mdcl ,t0? ,t1* ... (,t* ...))
          (build-tail-call info mdcl t0? t1* t*)]
         [(foreign-call ,info ,[t0] ,[t1*] ...)
-         `(seq
-            ; CAUTION: fv0 must hold return address when we call into C
-            ,(build-foreign-call info t0 t1* %ac0 #f)
-            (jump ,(get-ret-fv) (,%ac0)))]
+         ;; CAUTION: if not atomic, fv0 must hold return address when we call into C
+         (cond
+           [(or (memq 'save-errno (info-foreign-conv* info))
+                (memq 'save-last-error (info-foreign-conv* info)))
+            (let ([tmp (make-tmp 'errno)])
+              `(seq
+                ,(build-foreign-call info t0 t1* %ac0 tmp #f)
+                ,(build-mv-return (list %ac0 tmp))))]
+           [else
+            `(seq
+              ,(build-foreign-call info t0 t1* %ac0 #f #f)
+              (jump ,(get-ret-fv) (,%ac0)))])]
         [,rhs (do-return ,(Rhs ir))]
         [(values ,info ,[t]) (do-return ,t)]
         [(values ,info ,t* ...) (build-mv-return t*)]))
@@ -5674,7 +5817,9 @@
                          (jump ,%ref-ret (,%ac0)))
                        ; TODO: would be nice to avoid second cmpl here
                        (if ,(%inline < ,%ac0 (immediate 0))
-                           (seq (pariah) (goto ,Ldoargerr))
+                           ,(%seq (pariah)
+                                  (set! ,%ac0 (immediate 0)) ; restore supplied argument count
+                                  (goto ,Ldoargerr))
                            ,(%seq
                               (set! ,%ac0 ,(%inline sll ,%ac0 ,(%constant pair-shift)))
                               (set! ,%xp (alloc ,(make-info-alloc (constant type-pair) #f #f) ,%ac0))
@@ -10776,7 +10921,8 @@
               (pass np-suppress-procedure-checks unparse-L4)
               (pass np-recognize-mrvs unparse-L4.5)
               (pass np-expand-foreign unparse-L4.75)
-              (pass np-recognize-loops unparse-L4.875)
+              (pass np-recognize-loops unparse-L4.75)
+              (pass np-convert-loops unparse-L4.875)
               (pass np-recognize-attachment unparse-L4.9375)
               (pass np-name-anonymous-lambda unparse-L5)
               (pass np-convert-closures unparse-L6)

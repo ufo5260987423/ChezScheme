@@ -16,16 +16,23 @@
 
 #include "system.h"
 #include <setjmp.h>
+#include <errno.h>
 
 /* locally defined functions */
 static void split(ptr k, ptr *s);
-static void reset_scheme(void);
+static void reset_scheme(ptr tc);
 static NORETURN void do_error(iptr type, const char *who, const char *s, ptr args);
 static void handle_call_error(ptr tc, iptr type, ptr x);
 static void init_signal_handlers(void);
 static void keyboard_interrupt(ptr tc);
 
 static void (*register_modified_signal)(int);
+
+#ifdef WIN32
+typedef int *(*get_errno_ptr_t)(void);
+static get_errno_ptr_t msvcrt_get_errno_ptr;
+static get_errno_ptr_t ucrt_get_errno_ptr;
+#endif
 
 ptr S_get_scheme_arg(ptr tc, iptr n) {
 
@@ -316,9 +323,7 @@ void S_abnormal_exit() {
   abort();
 }
 
-static void reset_scheme() {
-    ptr tc = get_thread_context();
-
+static void reset_scheme(ptr tc) {
     alloc_mutex_acquire();
    /* eap should always be up-to-date now that we write-through to the tc
       when making any changes to eap when eap is a real register */
@@ -335,8 +340,8 @@ static void reset_scheme() {
  */
 
 void S_error_reset(const char *s) {
-
-    if (!S_errors_to_console) reset_scheme();
+    ptr tc = get_thread_context();
+    if (!S_errors_to_console && (tc != (ptr)0)) reset_scheme(tc);
     do_error(ERROR_RESET, "", s, Snil);
 }
 
@@ -464,6 +469,63 @@ void S_handle_mvlet_error(void) {
     handle_call_error(tc, ERROR_MVLET, Sfalse);
 }
 
+#ifdef WIN32
+static int *get_errno_ptr(void) {
+  return &errno;
+}
+#endif
+
+ptr S_save_errno(void) {
+    int errno_val;
+
+#ifdef WIN32
+    {
+      ptr tc = get_thread_context();
+      if (CURRENTERRNOSOURCE(tc) == Sfalse) {
+	errno_val = errno;
+      } else if (Schar_value(STRIT(SYMNAME(CURRENTERRNOSOURCE(tc)), 0)) == 'm' /* msvcrt */) {
+	if (!msvcrt_get_errno_ptr) {
+	  HMODULE hm;
+	  get_errno_ptr_t new_get_errno_ptr = NULL;
+	  hm = LoadLibrary("msvcrt.dll");
+	  if (hm)
+	    new_get_errno_ptr = (get_errno_ptr_t)GetProcAddress(hm, "_errno");
+	  if (!new_get_errno_ptr)
+	    new_get_errno_ptr = get_errno_ptr;
+	  while (msvcrt_get_errno_ptr == NULL) {
+	    COMPARE_AND_SWAP_PTR(&msvcrt_get_errno_ptr, NULL, new_get_errno_ptr);
+	  }
+	}
+	errno_val = *(msvcrt_get_errno_ptr());
+      } else {
+	if (!ucrt_get_errno_ptr) {
+	  HMODULE hm;
+	  get_errno_ptr_t new_get_errno_ptr = NULL;
+	  hm = LoadLibrary("ucrtbase.dll");
+	  if (hm)
+	    new_get_errno_ptr = (get_errno_ptr_t)GetProcAddress(hm, "_errno");
+	  if (!new_get_errno_ptr)
+	    new_get_errno_ptr = get_errno_ptr;
+	  while (ucrt_get_errno_ptr == NULL) {
+	    COMPARE_AND_SWAP_PTR(&ucrt_get_errno_ptr, NULL, new_get_errno_ptr);
+	  }
+	}
+	errno_val = *(ucrt_get_errno_ptr());
+      }
+    }
+#else
+    errno_val = errno;
+#endif
+
+    return Sinteger(errno_val);
+}
+
+#ifdef WIN32
+ptr S_save_last_error(void) {
+    return Sinteger(GetLastError());
+}
+#endif
+
 void S_handle_event_detour() {
     ptr tc = get_thread_context();
     ptr resume_proc = CP(tc);
@@ -533,9 +595,10 @@ void S_fire_collector(void) {
 
 void S_noncontinuable_interrupt(void) {
   ptr tc = get_thread_context();
-
-  reset_scheme();
-  KEYBOARDINTERRUPTPENDING(tc) = Sfalse;
+  if (tc != (ptr)0) {
+    reset_scheme(tc);
+    KEYBOARDINTERRUPTPENDING(tc) = Sfalse;
+  }
   do_error(ERROR_NONCONTINUABLE_INTERRUPT,"","",Snil);
 }
 
@@ -566,12 +629,9 @@ static BOOL WINAPI handle_signal(DWORD dwCtrlType) {
   switch (dwCtrlType) {
     case CTRL_C_EVENT:
     case CTRL_BREAK_EVENT: {
-#ifdef PTHREADS
-     /* get_thread_context() always returns 0, so assume main thread */
+      /* A new thread is created to handle these signals, so Scheme doesn't know about
+         it. Consequently, it interrupts the main thread. */
       ptr tc = TO_PTR(S_G.thread_context);
-#else
-      ptr tc = get_thread_context();
-#endif
       if (!THREAD_GC(tc)->during_alloc && Sboolean_value(KEYBOARDINTERRUPTPENDING(tc)))
         return(FALSE);
       keyboard_interrupt(tc);
@@ -585,6 +645,8 @@ static BOOL WINAPI handle_signal(DWORD dwCtrlType) {
 static LONG WINAPI fault_handler(LPEXCEPTION_POINTERS e) {
   if (e->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
     ptr tc = get_thread_context();
+    if (tc == (ptr)0) /* not a Scheme thread */
+      return EXCEPTION_CONTINUE_SEARCH;
     if (THREAD_GC(tc)->during_alloc)
       S_error_abort("nonrecoverable invalid memory reference");
     else
@@ -669,7 +731,7 @@ static void forward_signal_to_scheme(INT sig) {
 #ifdef PTHREADS
   /* deliver signals to the main thread, only; depending
      on the threads that are running, `tc` might even be NULL */
-  if (tc != TO_PTR(&S_G.thread_context)) {
+  if (tc != TO_PTR(S_G.thread_context)) {
     pthread_kill(S_main_thread_id, sig);
     RESET_SIGNAL
     return;
@@ -715,15 +777,79 @@ void S_register_scheme_signal(iptr sig) {
     sigaction(sig, &act, (struct sigaction *)0);
 }
 
-static void handle_signal(INT sig, UNUSED siginfo_t *si, UNUSED void *data) {
+/* the handlers that were installed for the fault signals before ours.  a
+   program that embeds Chez Scheme may handle these signals itself (.NET and
+   Java runtimes turn a null dereference into an exception that way), so a
+   fault that does not come from Scheme code is passed on to that handler,
+   and Sscheme_deinit puts them back. */
+#define MAXCHAINEDSIGNALS 4
+static INT chained_sig[MAXCHAINEDSIGNALS];
+static struct sigaction chained_act[MAXCHAINEDSIGNALS];
+static INT chained_count;
+
+static void save_previous_handler(INT sig, struct sigaction *prev) {
+  INT i;
+  /* never save our own handler: passing a fault to it would recurse */
+  if ((prev->sa_flags & SA_SIGINFO) && prev->sa_sigaction == handle_signal) return;
+  for (i = 0; i < chained_count; i += 1) {
+    if (chained_sig[i] == sig) {
+      chained_act[i] = *prev;
+      return;
+    }
+  }
+  if (chained_count < MAXCHAINEDSIGNALS) {
+    chained_sig[chained_count] = sig;
+    chained_act[chained_count] = *prev;
+    chained_count += 1;
+  }
+}
+
+/* pass sig to the handler saved for it, if any; returns 0 if there is
+   none to pass it to */
+static IBOOL chain_to_previous_handler(INT sig, siginfo_t *si, void *data) {
+  INT i;
+  for (i = 0; i < chained_count; i += 1) {
+    if (chained_sig[i] == sig) {
+      struct sigaction *prev = &chained_act[i];
+      if (prev->sa_flags & SA_SIGINFO) {
+        if (prev->sa_sigaction == NULL) return 0;
+        prev->sa_sigaction(sig, si, data);
+      } else {
+        if (prev->sa_handler == SIG_DFL || prev->sa_handler == SIG_IGN) return 0;
+        prev->sa_handler(sig);
+      }
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* a thread with no context is not running Scheme code, and neither is one
+   whose context is deactivated: it is in C, through a __collect_safe call,
+   after Sdeactivate_thread, or in one of the run time's blocking I/O calls */
+static IBOOL not_running_scheme(ptr tc) {
+  if (tc == (ptr)0) return 1;
+#ifdef PTHREADS
+  if (!ACTIVE(tc)) return 1;
+#endif
+  return 0;
+}
+
+static void handle_signal(INT sig, siginfo_t *si, void *data) {
 /* printf("handle_signal(%d) for tc %x\n", sig, UNFIX(get_thread_context())); fflush(stdout); */
+  /* a fault outside Scheme code goes to the handler installed before ours,
+     if there was one; only the fault signals have a saved handler */
+    if (not_running_scheme(get_thread_context())
+        && chain_to_previous_handler(sig, si, data))
+      return;
+
   /* check for particular signals */
     switch (sig) {
         case SIGINT: {
             ptr tc = get_thread_context();
            /* disable keyboard interrupts in subordinate threads until we think
              of something more clever to do with them */
-            if (tc == TO_PTR(&S_G.thread_context)) {
+            if (tc == TO_PTR(S_G.thread_context)) {
               if (!THREAD_GC(tc)->during_alloc && Sboolean_value(KEYBOARDINTERRUPTPENDING(tc))) {
                /* this is a no-no, but the only other options are to ignore
                   the signal or to kill the process */
@@ -752,16 +878,15 @@ static void handle_signal(INT sig, UNUSED siginfo_t *si, UNUSED void *data) {
 #ifdef SIGBUS
         case SIGBUS:
 #endif /* SIGBUS */
-        case SIGSEGV:
-          {
+        case SIGSEGV: {
             ptr tc = get_thread_context();
             RESET_SIGNAL
-            if (THREAD_GC(tc)->during_alloc)
+            if ((tc == (ptr)0) || THREAD_GC(tc)->during_alloc)
                 S_error_abort("nonrecoverable invalid memory reference");
             else
                 S_error_reset("invalid memory reference");
-          }
-	    break;
+            break;
+        }
         default:
             RESET_SIGNAL
             S_error_reset("unexpected signal");
@@ -775,7 +900,7 @@ static void no_op_register(UNUSED int sigid) {
 #define SIGACTION(id, act_p, old_p) (register_modified_signal(id), sigaction(id, act_p, old_p))
 
 static void init_signal_handlers(void) {
-    struct sigaction act;
+    struct sigaction act, prev;
 
     if (register_modified_signal == NULL)
       register_modified_signal = no_op_register;
@@ -813,15 +938,30 @@ static void init_signal_handlers(void) {
 #ifdef SIGQUIT
     SIGACTION(SIGQUIT, &act, (struct sigaction *)0);
 #endif /* SIGQUIT */
-    SIGACTION(SIGILL, &act, (struct sigaction *)0);
-    SIGACTION(SIGFPE, &act, (struct sigaction *)0);
+  /* keep the fault signals' previous handlers to pass foreign faults on to */
+    if (SIGACTION(SIGILL, &act, &prev) == 0) save_previous_handler(SIGILL, &prev);
+    if (SIGACTION(SIGFPE, &act, &prev) == 0) save_previous_handler(SIGFPE, &prev);
 #ifdef SIGBUS
-    SIGACTION(SIGBUS, &act, (struct sigaction *)0);
+    if (SIGACTION(SIGBUS, &act, &prev) == 0) save_previous_handler(SIGBUS, &prev);
 #endif /* SIGBUS */
-    SIGACTION(SIGSEGV, &act, (struct sigaction *)0);
+    if (SIGACTION(SIGSEGV, &act, &prev) == 0) save_previous_handler(SIGSEGV, &prev);
+}
+
+/* once Chez Scheme is gone, the fault signals belong to the host again */
+static void restore_previous_handlers(void) {
+    INT i;
+
+    for (i = 0; i < chained_count; i += 1)
+      SIGACTION(chained_sig[i], &chained_act[i], (struct sigaction *)0);
 }
 
 #endif /* WIN32 */
+
+void S_schsig_deinit(void) {
+#ifndef WIN32
+    restore_previous_handlers();
+#endif
+}
 
 void S_schsig_init(void) {
     if (S_boot_time) {

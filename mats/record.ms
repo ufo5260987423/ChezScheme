@@ -2870,6 +2870,69 @@
                      #f)
                  #f)
              #f))))
+
+  (error? ; not a record-type descriptor
+   (let ()
+     (define B.rcd (make-record-constructor-descriptor "wrong" #f #f))
+     (record-constructor B.rcd)))
+
+  (error? ; invalid record constructor descriptor
+   (let ()
+     (define A.rtd (make-record-type-descriptor 'A #f #f #f #f '#((immutable x))))
+     (define A.rcd (make-record-constructor-descriptor A.rtd #f "toast"))
+     (define B.rtd (make-record-type-descriptor 'B A.rtd #f #f #f '#((immutable y))))
+     (define B.rcd (make-record-constructor-descriptor B.rtd A.rcd #f))
+     (record-constructor B.rcd)))
+
+  (error? ; invalid record constructor descriptor
+   (let ()
+     (define A.rtd (make-record-type-descriptor 'A #f #f #f #f '#((immutable x))))
+     (define A.rcd (make-record-constructor-descriptor A.rtd #f #f))
+     (define B.rtd (make-record-type-descriptor 'B A.rtd #f #f #f '#((immutable y))))
+     (define B.rcd (make-record-constructor-descriptor B.rtd A.rcd "jam"))
+     (record-constructor B.rcd)))
+
+  (error? ; cannot create constructor descriptor for record type with non-scheme-object fields
+   (let ()
+     (define A.rtd (make-record-type "A" '((immutable double x))))
+     (define B.rtd (make-record-type-descriptor 'B A.rtd #f #f #f '#((immutable y))))
+     (define B.rcd (make-record-constructor-descriptor B.rtd #f #f))
+     (record-constructor B.rcd)))
+
+  (error? ; record constructor descriptor specified for base record type
+   (let ()
+     (define A.rtd (make-record-type-descriptor 'A #f #f #f #f '#((immutable x))))
+     (define A.rcd (make-record-constructor-descriptor A.rtd #f (lambda (new) (lambda () (new 1)))))
+     (define B.rtd (make-record-type-descriptor 'B #f #f #f #f '#((immutable y))))
+     (define B.rcd (make-record-constructor-descriptor B.rtd A.rcd #f))
+     (record-constructor B.rcd)))
+
+  (error? ; record constructor descriptor is not for parent of record type
+   (let ()
+     (define A.rtd (make-record-type-descriptor 'A #f #f #f #f '#((immutable x))))
+     (define A2.rtd (make-record-type-descriptor 'A #f #f #f #f '#((immutable x))))
+     (define A2.rcd (make-record-constructor-descriptor A2.rtd #f #f))
+     (define B.rtd (make-record-type-descriptor 'B A.rtd #f #f #f '#((immutable y))))
+     (define B.rcd (make-record-constructor-descriptor B.rtd A2.rcd #f))
+     (record-constructor B.rcd)))
+
+  (error? ; no protocol specified for B.rcd, but parent A.rcd does specify a protocol
+   (let ()
+     (define A.rtd (make-record-type-descriptor 'A #f #f #f #f '#((immutable x))))
+     (define A.rcd (make-record-constructor-descriptor A.rtd #f (lambda (new) (lambda () (new 1)))))
+     (define B.rtd (make-record-type-descriptor 'B A.rtd #f #f #f '#((immutable y))))
+     (define B.rcd (make-record-constructor-descriptor B.rtd A.rcd #f))
+     (record-constructor B.rcd)))
+
+  (error? ; no protocol specified for B.rcd, but parent A.rcd does specify a protocol
+   (let ()
+     (define A.rtd (make-record-type-descriptor 'A #f #f #f #f '#((immutable x))))
+     (define A.rcd (make-record-constructor-descriptor A.rtd #f (lambda (new) (lambda () (new 1)))))
+     (define B.rtd (make-record-type-descriptor 'B A.rtd #f #f #f '#((immutable y))))
+     (define B.rcd (make-record-constructor-descriptor B.rtd A.rcd #f))
+     ;; cp0 may fold the predicate, but will residualize a call to make-record-constructor-descriptor
+     ;; that raises an exception
+     (record-constructor-descriptor? B.rcd)))
 )
 
 (mat record-writer
@@ -3593,6 +3656,7 @@
                '()               ; no fields to add
                #t                ; sealed
                #f                ; not opaque
+               #f                ; no alt-pm
                '*sym->index*     ; extras (tacked onto end of rtd)
                '*index->sym*)])  ; i.e., static (per enumeration type) fields
         (let ([make-this-enum (record-constructor this-enum-rtd)])
@@ -3605,8 +3669,8 @@
                 (get-index->sym rtd)))))))
     '(*members* *sym->index* *index->sym*))
   (error? ; cannot extend sealed record type
-    (let ([rtd1 (#%$make-record-type #!base-rtd #f "foo" '() #t #f '())])
-      (#%$make-record-type #!base-rtd rtd1 "bar" '() #f #f '())))
+    (let ([rtd1 (#%$make-record-type #!base-rtd #f "foo" '() #t #f #f '())])
+      (#%$make-record-type #!base-rtd rtd1 "bar" '() #f #f #f '())))
 )
 
 (mat record25
@@ -3789,9 +3853,9 @@
                (define-syntax a
                  (lambda (x)
                    (let* ([rtd1 (#%$make-record-type #!base-rtd #!base-rtd
-                                  "rtd1" '((mutable q)) #f #f)]
+                                  "rtd1" '((mutable q)) #f #f #f)]
                           [rtd2 (#%$make-record-type rtd1 #!base-rtd
-                                  "rtd2" '() #f #f #f)])
+                                  "rtd2" '() #f #f #f #f)])
                      ((record-mutator rtd1 0) rtd2 rtd2)
                      #`(quote #,rtd2))))
                a))))
@@ -3818,11 +3882,11 @@
                (define-syntax a
                  (lambda (x)
                    (let* ([rtd1 (#%$make-record-type #!base-rtd #!base-rtd
-                                  "rtd1" '((mutable q)) #f #f)]
+                                  "rtd1" '((mutable q)) #f #f #f)]
                           [rtd2 (#%$make-record-type rtd1 #!base-rtd
-                                  "rtd2" '() #f #f #f)]
+                                  "rtd2" '() #f #f #f #f)]
                           [rtd3 (#%$make-record-type rtd2 #!base-rtd
-                                  "rtd3" '() #f #f)])
+                                  "rtd3" '() #f #f #f)])
                      ((record-mutator rtd1 0) rtd2 rtd3)
                      #`(quote #,rtd3))))
                a))))
@@ -3848,11 +3912,11 @@
                (define-syntax a
                  (lambda (x)
                    (let* ([rtd1 (#%$make-record-type #!base-rtd #!base-rtd
-                                  "rtd1" '((mutable q)) #f #f)]
+                                  "rtd1" '((mutable q)) #f #f #f)]
                           [rtd2 (#%$make-record-type rtd1 #!base-rtd
-                                  "rtd2" '() #f #f #f)]
+                                  "rtd2" '() #f #f #f #f)]
                           [rtd3 (#%$make-record-type rtd2 #f
-                                  "rtd3" '((immutable a)) #f #f)])
+                                  "rtd3" '((immutable a)) #f #f #f)])
                      ((record-mutator rtd1 0) rtd2 ((record-constructor rtd3) 23))
                      #`(quote #,rtd3))))
                a))))
