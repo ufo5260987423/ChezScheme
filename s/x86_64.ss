@@ -643,6 +643,14 @@
     [(op (x fpur) (y fpmem) (z fpmem fpur))
      `(set! ,(make-live-info) ,x (asm ,info ,(asm-fpop-2 op) ,y ,z))])
 
+  (define-instruction value (fpmin fpmax)
+    [(op (x fpur) (y fpur) (z fpmem fpur))
+     (seq
+      `(move-related ,x ,y)
+      `(set! ,(make-live-info) ,x (asm ,info ,(asm-fpminmax op) ,y ,z)))]
+    [(op (x fpur) (y fpmem) (z fpmem fpur))
+     `(set! ,(make-live-info) ,x (asm ,info ,(asm-fpminmax op) ,y ,z))])
+
   (define-instruction value (fpsqrt)
     [(op (x fpur) (y fpmem fpur)) `(set! ,(make-live-info) ,x (asm ,info ,asm-fpsqrt ,y))])
 
@@ -887,7 +895,7 @@
                      asm-lea1 asm-lea2 asm-indirect-call asm-condition-code
                      asm-fl-cvt asm-store-single asm-load-single asm-fpt asm-fptrunc asm-div asm-popcount
                      asm-exchange asm-pause asm-debug asm-locked-incr asm-locked-decr asm-locked-cmpxchg
-                     asm-fpsqrt asm-fpop-2 asm-fpmove asm-fpcast asm-fpsingle
+                     asm-fpsqrt asm-fpop-2 asm-fpminmax asm-fpmove asm-fpcast asm-fpsingle
                      asm-c-simple-call
                      asm-save-flrv asm-restore-flrv asm-return asm-c-return asm-size
                      asm-enter asm-foreign-call asm-foreign-callable
@@ -1077,6 +1085,24 @@
   (define-op sse.subsd     sse-op1 #xF2 #x5C 0)
   (define-op sse.ucomisd   sse-op1 #x66 #x2E 0)
   (define-op sse.xorpd     sse-op1 #x66 #x57 0)
+  (define-op sse.minsd     sse-op1 #xF2 #x5D 0)
+  (define-op sse.maxsd     sse-op1 #xF2 #x5F 0)
+  (define-op sse.orpd      sse-op1 #x66 #x56 0)
+  (define-op sse.cmpunordpd sse-cmpunordpd-op #x66 #xC2 0)
+
+  (define sse-cmpunordpd-op
+    ; CMPPD with the UNORD predicate, emitted with a trailing
+    ; immediate byte of 3
+    (lambda (op prefix-code op-code w source dest-reg code*)
+      (emit-code (op source dest-reg code*)
+        (build byte prefix-code)
+        (ax-ea-rex w source dest-reg #f)
+        (build byte #x0F)
+        (build byte op-code)
+        (ax-ea-modrm-reg source dest-reg)
+        (ax-ea-sib source)
+        (ax-ea-addr-disp source)
+        (build byte 3))))
 
   (define sse-op1
     (lambda (op prefix-code op-code w source dest-reg code*)
@@ -1847,6 +1873,39 @@
                        (emit-it dest-reg dest-reg code*))
                  (emit sse.movsd src1 dest-reg
                        (emit-it src2 dest-reg code*))))]))))
+
+  (define asm-fpminmax
+    ; NaN-propagating flonum min/max, branchless (SSE2 only).
+    ;
+    ;   m = (min|max)sd(a, b)      ; the answer unless a NaN is involved;
+    ;                              ; a NaN input yields b (garbage case)
+    ;   k = cmpunordpd(a, b)       ; all-ones iff either input is NaN
+    ;                              ; (all-ones is itself a NaN bit pattern)
+    ;   r = m | k                  ; NaN case: garbage | all-ones = NaN;
+    ;                              ; normal case: m | 0 = m (sign preserved)
+    ;
+    ; src1/src2 are saved into %Cfparg1/%Cfparg2 up front so the sequence
+    ; is safe no matter which of dest-reg/src1/src2 alias each other (the
+    ; C fp-argument registers serve as scratch here the same way %Cfparg1
+    ; does in asm-fpop-2).  Equivalent to the R6RS-mandated compare and
+    ; NaN-check sequence it replaces; the NaN payload is unspecified.
+    (lambda (op)
+      (lambda (code* dest-reg src1 src2)
+        (define (emit-min/max a b code*)
+          (case op
+            [(fpmin) (emit sse.minsd b a code*)]
+            [(fpmax) (emit sse.maxsd b a code*)]))
+        (Trivit (dest-reg src1 src2)
+          (emit sse.movsd src1 (cons 'reg %Cfparg1)
+          (emit sse.movsd src2 (cons 'reg %Cfparg2)
+          (emit sse.cmpunordpd (cons 'reg %Cfparg2) (cons 'reg %Cfparg1)
+          (if (equal? src1 dest-reg)
+              ;; src1 already where the result goes; just compute
+              (emit-min/max dest-reg (cons 'reg %Cfparg2)
+                (emit sse.orpd (cons 'reg %Cfparg1) dest-reg code*))
+              (emit sse.movsd src1 dest-reg
+                (emit-min/max dest-reg (cons 'reg %Cfparg2)
+                  (emit sse.orpd (cons 'reg %Cfparg1) dest-reg code*)))))))))))
 
   (define asm-fpsqrt
     (lambda (code* dest-reg src)
