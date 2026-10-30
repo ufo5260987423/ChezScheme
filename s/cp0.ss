@@ -2894,6 +2894,30 @@
         (define-inline-ash-op bitwise-arithmetic-shift-left)
         (define-inline-ash-op bitwise-arithmetic-shift-right))
 
+      (let ()
+        ; fold quoted-flonum calls at compile time; the generic fold
+        ; cannot be used (mifoldable+) since calling the compiler's own
+        ; flmin at compile time would turn (guard (e [...]) (flmin 3.0 'a))
+        ; into a compile-time error, changing when the error is raised.
+        ; Defer to the compiler's own generic min/max only for flonum
+        ; literals, where no error is possible.
+        (define (try-fold-flminmax ctxt prim-name x y)
+          (let ([xval (nanopass-case (Lsrc Expr) (result-exp (value-visit-operand! x))
+                        [(quote ,d) (and (flonum? d) d)]
+                        [else #f])]
+                [yval (nanopass-case (Lsrc Expr) (result-exp (value-visit-operand! y))
+                        [(quote ,d) (and (flonum? d) d)]
+                        [else #f])])
+            (and xval
+                 yval
+                 (let ([r (if (eq? prim-name 'flmin) (min xval yval) (max xval yval))])
+                   (residualize-seq '() (list x y) ctxt)
+                   `(quote ,r)))))
+        (define-inline 3 (flmin flmax)
+          [(x y) (try-fold-flminmax ctxt prim-name x y)])
+        (define-inline 2 (flmin flmax)
+          [(x y) (try-fold-flminmax ctxt prim-name x y)]))
+
       (define-inline 3 fxbit-field ; expose internal fx ops for partial optimization
         [(?n ?start ?end)
          (cp0
