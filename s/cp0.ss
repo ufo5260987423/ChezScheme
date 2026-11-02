@@ -2885,6 +2885,29 @@
         (define-inline-ash-op bitwise-arithmetic-shift-left)
         (define-inline-ash-op bitwise-arithmetic-shift-right))
 
+      (let ()
+        ; fold quoted-flonum calls at compile time; the generic fold
+        ; cannot be used (mifoldable+) since calling the compiler's own
+        ; flround at compile time would turn (guard (e [...]) (flround 1.0 'a))
+        ; into a compile-time error, changing when the error is raised.
+        ; Defer to the compiler's own rounding operators only for flonum
+        ; literals, where no error is possible.
+        (define (try-fold-flrounding ctxt name x)
+          (let ([xval (nanopass-case (Lsrc Expr) (result-exp (value-visit-operand! x))
+                        [(quote ,d) (and (flonum? d) d)]
+                        [else #f])])
+            (and xval
+                 (let ([r (case name
+                            [(flround) (flround xval)]
+                            [(flfloor) (flfloor xval)]
+                            [(flceiling) (flceiling xval)]
+                            [(fltruncate) (fltruncate xval)])])
+                   (residualize-seq '() (list x) ctxt)
+                   `(quote ,r)))))
+        (define-inline 3 (flround flfloor flceiling fltruncate)
+          [(x) (try-fold-flrounding ctxt prim-name x)])
+        (define-inline 2 (flround flfloor flceiling fltruncate)
+          [(x) (try-fold-flrounding ctxt prim-name x)]))
       (define-inline 3 fxbit-field ; expose internal fx ops for partial optimization
         [(?n ?start ?end)
          (cp0
