@@ -42,7 +42,7 @@ that prepends byte items `(byte . n)` / `(word . n)` / `(long . n)` / `(quad . n
 
 ## Contract cards: the select family
 
-The select family is the knowledge base's worked example of a layer-1 contract (see `../README.md` and the case study `../05-case-studies/select-nan-reverse-bool.md`). There are six emitters — `asm-isel-regs`, `asm-isel-imms`, `asm-isel-bool` (`:2423`, `:2472`, `:2485`) for fixnum compares and `asm-fpsel-regs`, `asm-fpsel-imms`, `asm-fpsel-bool` (`:2513`, `:2550`, `:2562`) for flonum compares — and the clauses that feed them at `:410-499` (isel) and `:500-619` (fpsel).
+The select family is the knowledge base's worked example of a layer-1 contract (see `../README.md` and the case study `../05-case-studies/select-nan-reverse-bool.md`). There are six emitters — `asm-isel-regs`, `asm-isel-imms`, `asm-isel-bool` (`:2423`, `:2472`, `:2485`) for fixnum compares and `asm-fpsel-regs`, `asm-fpsel-imms`, `asm-fpsel-bool` (`:2511`, `:2539`, `:2552`) for flonum compares — and the clauses that feed them at `:379-499` (isel) and `:502-615` (fpsel). Note the family has only four members since `%fpsel=` was dropped (commit `d60a8ab1`).
 
 ### Card: `asm-isel-regs` (fixnum select, register arms)
 
@@ -66,7 +66,7 @@ The select family is the knowledge base's worked example of a layer-1 contract (
 
 | Field | Content |
 |---|---|
-| Producers | `fpsel` clause `[(op (z ur) (x fpur) (y fpur) (u ur) (v ur))]` (`s/x86_64.ss:611-619`); reachable only for `%fp<`/`%fp<=` — `pred->fpsel` (`s/cpnanopass.ss:3769-3781`) maps only those two and explicitly excludes `fp=` ("its cmov would fire on the unordered ZF=1, and the compensating jp's offset has proven fragile under register coalescing"). |
+| Producers | `fpsel` clause `[(op (z ur) (x fpur) (y fpur) (u ur) (v ur))]` (`s/x86_64.ss:609`); reachable only for `%fp<`/`%fp<=` — `pred->fpsel` (`s/cpnanopass.ss:3770`) maps only those two; `%fpsel=` was dropped from the family entirely (commit `d60a8ab1`) because its unordered escape was never made robust. |
 | Reachable shapes | Same aliasing degrees of freedom as `asm-isel-regs`: dest may equal u, v, x, or y after coalescing. Equality (`cc = #x04`) additionally reaches this emitter in principle — the emitter still carries the `jp` path for it (`:2518-2529`), but no producer currently generates it. |
 | Invariants | (1) `ucomisd` reads x and y before any write; dest aliasing is safe by R-4. (2) Aliasing dispatch on `(equal? dest u)` / `(equal? dest v)` mirrors `asm-isel-regs`, with the extra equality case using a `jp` whose skip length is computed from the emitted `mov` length (`movlen` at :2520-2521) — not a hand count (RULE-TRUTH-NA). (3) Conditions are the T-2 rows with the reversed operand read: `fpsel< → cmova (#x07)`, `fpsel<= → cmovae (#x03)`, `fpsel> → cmovb (#x02)`, `fpsel>= → cmovbe (#x06)`; on unordered, CF=ZF=PF=1 makes `a/ae/b/be` yield the else bit in **both** arm orders — no escape (T-2 ⚠ column excepted). |
 | Derived from | T-2 + R-1/R-2/R-4 of [`flags-truth-tables.md`](flags-truth-tables.md); open thread on enabling equality selects in the case study. |
@@ -86,7 +86,7 @@ The select family is the knowledge base's worked example of a layer-1 contract (
 |---|---|
 | Producers | The `(z mem)` clauses (`s/x86_64.ss:423-445`, `:546-566`) for memory destinations and the non-boolean `(u imm)(v imm)` fallback (`:470-487`, `:592-610`). |
 | Reachable shapes | then-value pre-bound to a scratch `u` by the clause via a plain `set!`; dest may be memory. |
-| Invariants | (1) The clause presets the scratch **with a plain `set!` before the self-referential `asm`** — the unspillable-conflict walk requirement behind RULE-UNSPILL (commit `5b6227fb`, "x86_64: preset the select temp for memory destinations"; see [instruction-selection.md](instruction-selection.md)). (2) Memory clauses are listed **before** the `ur` clauses so the `ur` predicate never sees a memory destination and routes it through an instruction-selection temporary whose self-referential asm would trip that walk — this ordering is itself part of the contract. (3) FP immediate form keeps the computed `jp` for the equality condition (`:2556-2558` in `asm-fpsel-imms`). |
+| Invariants | (1) The clause presets the scratch **with a plain `set!` before the self-referential `asm`** — the unspillable-conflict walk requirement behind RULE-UNSPILL (commit `5b6227fb`, "x86_64: preset the select temp for memory destinations"; see [instruction-selection.md](instruction-selection.md)). (2) Memory clauses are listed **before** the `ur` clauses so the `ur` predicate never sees a memory destination and routes it through an instruction-selection temporary whose self-referential asm would trip that walk — this ordering is itself part of the contract. (3) FP emitters never receive the equality condition — `%fpsel=` was dropped from the family (commit `d60a8ab1`) — so no `jp` is emitted anywhere in the family. |
 | Derived from | RULE-UNSPILL in `../04-verification/review-checklists.md`; the `(z mem)` clause comments at `s/x86_64.ss:416-422` and `:538-545`. |
 
 ## Verifying a change here

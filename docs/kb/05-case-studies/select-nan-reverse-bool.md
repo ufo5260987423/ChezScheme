@@ -42,7 +42,7 @@ The `jp` pins unordered results at 0 = `#f`. The `define-instruction` clause inv
 | be (#x06) — reverse `<` (inverted) | **1 = else ✓** (no jp needed) |
 | e (#x04) — equality | 1 ⚠ (misfires; jp needed, and only correct for the forward form) |
 
-For `<`/`<=` the flags already produce the else bit in **both** arm orders. The `jp` was not merely misplaced — it was unnecessary, and harmful in the reverse order. Fix: emit the `jp` only for the equality condition (which `pred->fpsel` does not currently generate anyway; `s/cpnanopass.ss:3769` excludes `fp=` because its `cmov` fires on unordered ZF=1 and the compensating skip proved fragile).
+For `<`/`<=` the flags already produce the else bit in **both** arm orders. The `jp` was not merely misplaced — it was unnecessary, and harmful in the reverse order. Fix: emit the `jp` only for the equality condition (which `pred->fpsel` does not currently generate anyway; `s/cpnanopass.ss:3769` excludes `fp=` because its `cmov` fires on unordered ZF=1 and the compensating skip proved fragile). The equality special-casing was later removed with the family member itself — see the open-thread resolution below.
 
 ## Why every surface test stayed green (masked reachability)
 
@@ -78,6 +78,15 @@ Verified after the fix: the reproducer returns `#t`; fx and fl mats pass at o=0 
 | Derivation rules R-1…R-4 and the T-2 unordered column | `../../03-backend/flags-truth-tables.md` |
 | Executable cross-checker | `../../tools/verify-select-semantics.ss` |
 
-## Open thread
+## Open thread — resolved by removal
 
-`fp=` equality selects remain excluded from `pred->fpsel`. Enabling them requires an unordered escape whose skip offset is computed from the emitted code and correct in **both** arm orders — the equality row of T-2 is the one cell where no single `jp` placement serves both orders. Whoever picks this up: start from checklist RULE-TRUTH-NA.
+`fp=` equality selects remain excluded from `pred->fpsel`, but the
+hazardous machinery is gone: commit `d60a8ab1` dropped `%fpsel=` from
+the instruction family and from `np-languages` entirely. The
+replacement path, if equality selects are ever wanted: the skip must
+be **computed from the emitted code** (not a length guess) and the
+setcc boolean materialization cannot serve equality in both arm
+orders at all (unordered ZF=1 aliases ordered-equal — no single
+setcc/jp placement works), so a reintroduction needs a different
+boolean sequence or the cmov forms only. Start from checklist
+RULE-TRUTH-NA.
