@@ -59,6 +59,10 @@ Untyped `fl<` at o≤2 expands to nested `%type-check?` conditionals around the 
 
 At o=3 the level-3 handler inlines `fl<` with no checks (`s/cpprim.ss:5211-5214`), so this mask disappears and Eater 1/2 are the whole story.
 
+### Eater 3b — assignment conversion boxes destinations (`np-convert-assignments`, :831)
+
+Not a pred rewrite but an operand destroyer: a lambda argument or assigned `let` variable that a same-destination select would write in place is boxed before `np-normalize-context` runs, so the destination arrives as an `mref` and `select-triv-operand` declines it. Verified by trace (commit 2db91a6a): both `(if (fx< x y) (set! x x) (set! x y))` on arguments and the same shape on assigned locals show zero `%isel` in the `np-normalize-context` output. Consequence: source-level in-place min/max compiles branchily regardless of the dest-is-then decline; a box-aware lowering is the follow-up.
+
 ### Eater 4 — the seq-lift swap gate (`lift-seq-pred`, :3853)
 
 `lift-seq-pred` unwraps `(if (seq e … (inline pred …)) t1 t2)` so the trailing comparison meets the select matcher, and it *can* swap arms for one shape — `(if (inline pred …) (false) (true))` — but the swap branch is gated on `pred->isel` only (`:3863-3869`, gate at `:3864`):
@@ -137,3 +141,40 @@ Runtime spot-checks all pass (`(1.0 2.0)⇒#f`, `(2.0 1.0)⇒#t`, `(1.0 1.0)⇒#
 - A backend specialization's contract card must state which IR shapes reach it *after these five eaters*, not which source shapes produce it. "Any `(if (fl< ..) #f #t)`" is a false contract; "a same-destination `%fpsel<` with `(u sfalse)(v strue)`" is a true one.
 - Per `RULE-REACH` (`../04-verification/reachability-rule.md`), a mat for such a specialization carries path evidence; per `RULE-SHAPE`, it names the recipe that forces the covered shape. The table above is the map from "recipe" to "which eater it defeats".
 - Emitter reasoning follows `../03-backend/flags-truth-tables.md` (R-1/R-2 in particular): both arm orders are legal IR, so both must be derivable from the truth tables even when only one is reachable from natural source today.
+
+## Design record: safe-op flattening (the reassociation rule)
+
+Status: design verified, implementation in progress on `x86-64-select`.
+
+The safe-wrapper shape at L10.5 (traced, untyped `fx<`, o=2; simpler than the
+`(if (if (both-fixnums? …) …) …)` sketch in the #1097 review — the
+both-fixnums check is one instruction):
+
+```
+(if (if (seq (set! t (inline %logor x y))
+             (inline %log!test t 7))
+        (inline %< x y)
+        (seq (pariah) (set! tmp (mvcall fx< x y ()))
+             (if (inline %eq? tmp sfalse) (false) (true))))
+    then
+    else)
+```
+
+The exact reassociation (sound for *any* false-path call — no pariah
+assumption, no `info-call-error?` analysis, because the call's result feeds
+the same arm choice through the rebuilt truthiness check):
+
+```
+(if (if test cmp fp) t1 t2)
+  => (if test (if cmp t1 t2) (seq eff… (if (eq? tmp #f) t2 t1)))
+```
+
+Only the test-true path becomes branchless — the cold path keeps its
+structure. `flatten-safe-pred` matches the outer nest and requires the
+comparison to have a select form; `match-call-truthiness` decomposes the
+false path into its effect prefix plus the tested tmp, requiring the
+generator's exact `predicafy-rhs` shape (last effect sets the tested tmp).
+Open engineering issue: constructing the rebuilt `Effect:if`/`Tail:if` in
+`with-output-language` — the `%inline` template's record nonterminal in the
+pred slot (`unexpected Expr`); the fix is to build the eq? test as an
+explicit `(L11 Pred)`-typed subform.

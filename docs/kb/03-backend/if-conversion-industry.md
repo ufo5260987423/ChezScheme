@@ -63,11 +63,11 @@ Aligned with industry: machine-independent select abstraction + backend shape sp
 Gaps, in industry-precedence order:
 
 1. **General immediate rule** — generalize `B+(A−B)·b` beyond the `strue/sfalse` pair (GCC `noce_try_store_flag_constants`; the review's explicit ask).
-2. **min/max/abs recognition** — recognize the `(a < b ? a : b)` select shape and route to min/max-style emission (GCC `noce_try_minmax`; connects the cmov-fxminmax branch).
+2. **min/max/abs recognition** — recognize the `(a < b ? a : b)` select shape and route to min/max-style emission (GCC `noce_try_minmax`; connects the cmov-fxminmax branch). Finding from lifting the dest-is-then decline (commit 2db91a6a): source-level in-place min/max on arguments or assigned variables is eaten by assignment conversion first — the destination arrives as mrefs and the select conversion declines, so the common shapes stay branchy until a box-aware lowering exists.
 3. **AArch64 `csel`** — the conversion is backend-independent; already promised in the PR description.
 4. **Conservative reverse conversion** — structural heuristic first (loop-carried select + expensive condition → back to branch), profile-based refinement only if Chez ever grows branch weights.
 5. **Mixed immediate/uvar operands** — accept by coercing the immediate side to a scratch (the imms clause already presets one); LLVM gets this free from SSA.
-6. **safe-operation nested shapes** — the `(if (if (both-fixnums? …) (unsafe-fx< …) (error …)) c d)` nest; needs error-escape recognition, the hardest item, industry practice offers no shortcut.
+6. **safe-operation nested shapes** — the `(if (if TEST (unsafe-cmp …) FALSEP) c d)` nest. Industry's error-escape analysis is avoidable: the exact reassociation `(if (if test cmp fp) t1 t2)` ≡ `(if test (if cmp t1 t2) (seq eff… (if (eq? tmp #f) t2 t1)))` is sound for *any* call, no escape assumption. Design recorded in `../02-mid-end/cp0-shape-eating.md` (Eater 3); implementation in progress on `x86-64-select`.
 
 Do not build yet: profile-driven profitability (no profiler in Chez), unordered FP predicates in the IR (the condition-code model plus the T-2 table is the equivalent apparatus).
 

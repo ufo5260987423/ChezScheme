@@ -10,6 +10,16 @@ Normative checklists for reviewing backend/compiler work. Rules prefixed `[RULE-
 - [ ] **[RULE-PRODUCERS]** The PR lists the passes that can produce the new instruction/emitter call (e.g. `rhs-inline`, `select-if`, `select-tail`, cpprim inlining) and argues which operand/flag shapes each can deliver — or adds a `safe-assert`/guard.
 - [ ] **[RULE-ALIAS]** Destination/operand aliasing is handled at emit time by dispatching on the actual register relationships (`(equal? dest u)`, `(equal? dest v)`), not by a single preset sequence — the allocator may coalesce any pair (see `asm-fpsel-regs`, `s/x86_64.ss:2513`; the 2025 bootstrap bignum miscompile came from a preset clobbering a coalesced operand).
 - [ ] **[RULE-UNSPILL]** Any new scratch introduced in an instruction clause is assigned by a plain `set!` before the self-referential `asm` (unspillable-conflict walk requirement; see the `(z mem)` clause history, commit 5b6227fb).
+- [ ] **[RULE-IMM-DOMAIN]** Hand-built immediate encodings (`#x83`-style imm8
+      byte sequences) are checked against the *tagged* immediate domain, not
+      the source-level constant: a select between fixnums 40 and 8 works on
+      machine words 320 and 64, and a base above imm8 range silently
+      truncates — corrupting not the test that caught it but the compiler's
+      own bootstrap code that used the shape. Prefer `emit addi`/`emit movi`
+      (they pick imm8/imm32/full-quad by range); any remaining hand-built
+      imm must state its range assumption. (Incident: the arith select's
+      first revision miscompiled `library.ss`'s define-syntax handling at
+      bootstrap time, commit 4d0461ef.)
 
 ## B. Tests accompanying a backend specialization
 
