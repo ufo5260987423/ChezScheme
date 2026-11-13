@@ -1,6 +1,6 @@
 # The x86_64 Backend: Three Sections and the Select Family Contract Cards
 
-*Purpose: a guided read of `s/x86_64.ss` — registers, instruction selection, assembler — plus the full contract cards for the `isel`/ `fpsel` select family, the reference example for layer-1 design contracts in this knowledge base (`../README.md`). All other `<arch>.ss` files (arm64, riscv64, loongarch64, ppc32, arm32, pb) have the same three-section structure; only the contents differ. Line numbers track the current `sel-stage3` checkout.*
+*Purpose: a guided read of `s/x86_64.ss` — registers, instruction selection, assembler — plus the full contract cards for the `isel`/ `fpsel` select family, the reference example for layer-1 design contracts in this knowledge base (`../README.md`). All other `<arch>.ss` files (arm64, riscv64, loongarch64, ppc32, arm32, pb) have the same three-section structure; only the contents differ. Line numbers track the current `x86-64-select` checkout.*
 
 ## Section 1: registers (`s/x86_64.ss:14-90`)
 

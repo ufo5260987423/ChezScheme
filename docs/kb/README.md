@@ -2,7 +2,7 @@
 
 A knowledge base about how the Chez Scheme compiler turns source code into machine code: the instruction sets, the assembler emitters, and the nanopass optimizations in between.
 
-This is not passive documentation. It is organized as a **constraint system** so that the bug classes seen in the `sel-stage3` select work (hardcoded semantic shortcuts in emitters, masked by mid-end normalization, invisible to value tests) become harder to reintroduce.
+This is not passive documentation. It is organized as a **constraint system** so that the bug classes seen in the `x86-64-select` select work (hardcoded semantic shortcuts in emitters, masked by mid-end normalization, invisible to value tests) become harder to reintroduce.
 
 ## The four constraint layers
 
@@ -27,4 +27,4 @@ Rules written in *italics* prefixed with `[RULE]` are normative: new backend wor
 
 ## Code anchors
 
-Articles cite code as `file:line`. Line numbers track the `sel-stage3` branch (cpnanopass.ss is ~11k lines and fairly stable), but always verify against your checkout.
+Articles cite code as `file:line`. Line numbers track the `x86-64-select` branch (cpnanopass.ss is ~11k lines and fairly stable), but always verify against your checkout.

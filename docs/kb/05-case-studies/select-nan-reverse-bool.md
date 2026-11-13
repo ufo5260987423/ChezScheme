@@ -1,6 +1,6 @@
 # Case Study: The Reverse-Order `asm-fpsel-bool` NaN Bug
 
-The reference incident for the whole verification layer of this knowledge base. Fixed in commits `dd3eed46` (emitter) and `a8e3eb6d` (mats) on `sel-stage3`.
+The reference incident for the whole verification layer of this knowledge base. Fixed in commits `dd3eed46` (emitter) and `a8e3eb6d` (mats) on `x86-64-select`.
 
 ## Symptom
 

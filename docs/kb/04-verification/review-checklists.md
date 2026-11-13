@@ -1,6 +1,6 @@
 # Review Checklists
 
-Normative checklists for reviewing backend/compiler work. Rules prefixed `[RULE-…]` are enforced on the `sel-stage3`-lineage PRs; each rule points at the article that justifies it.
+Normative checklists for reviewing backend/compiler work. Rules prefixed `[RULE-…]` are enforced on the `x86-64-select`-lineage PRs; each rule points at the article that justifies it.
 
 ## A. Backend specialization (new/changed emitter or `define-instruction` clause)
 

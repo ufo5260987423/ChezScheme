@@ -1,6 +1,6 @@
 # Backend: Instruction Set, Assembler Emission, Code Generation
 
-Articles on the machine layer: descriptions, selection, assembly, flags, generation, and the portable backend. Anchors verified against the current `sel-stage3` checkout (see `../00-overview/compilation-pipeline.md`).
+Articles on the machine layer: descriptions, selection, assembly, flags, generation, and the portable backend. Anchors verified against the current `x86-64-select` checkout (see `../00-overview/compilation-pipeline.md`).
 
 ## Present
 

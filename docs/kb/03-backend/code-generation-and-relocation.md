@@ -1,6 +1,6 @@
 # Code Generation and Relocation: From L16 Byte Stream to Linked Code Object
 
-*Purpose: the last two compiler stages — `np-generate-code`'s two-pass chunk emission and the `c-mkcode` → `s/reloc.ss` → C (`c/prim5.c`, `c/prim.c`) relocation pipeline that turns placeholders into runnable addresses. Line numbers verified against the current `sel-stage3` checkout.*
+*Purpose: the last two compiler stages — `np-generate-code`'s two-pass chunk emission and the `c-mkcode` → `s/reloc.ss` → C (`c/prim5.c`, `c/prim.c`) relocation pipeline that turns placeholders into runnable addresses. Line numbers verified against the current `x86-64-select` checkout.*
 
 ## Stage 1: `np-generate-code` (`s/cpnanopass.ss:8437`)
 
