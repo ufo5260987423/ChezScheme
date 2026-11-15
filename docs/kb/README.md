@@ -21,7 +21,7 @@ Rules written in *italics* prefixed with `[RULE]` are normative: new backend wor
 - `01-nanopass/` — the nanopass framework (`define-language`, `define-pass`) and the L1–L16 language ladder.
 - `02-mid-end/` — the mid-end passes: closure conversion, primitive expansion, calling conventions, basic blocks.
 - `03-backend/` — machine descriptions, instruction selection, the x86_64 assembler, flag semantics, code generation, relocation, and the pb backend.
-- `04-verification/` — the reachability rule, shape-forcing recipes, and review checklists.
+- `04-verification/` — the reachability rule, shape-forcing recipes, expected-output (`experr`) mechanics, and review checklists.
 - `05-case-studies/` — post-mortems, each following the template: contract violation → truth-table derivation → why surface tests stayed green → forced-shape reproduction → fix → what was distilled into contracts/checklists/tools.
 - `tools/` — runnable verification scripts.
 

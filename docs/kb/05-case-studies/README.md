@@ -15,6 +15,7 @@ Design case studies (optimizations authored with the KB rules already in mind) a
 ## Present
 
 - [`select-nan-reverse-bool.md`](select-nan-reverse-bool.md) — the reverse-order `asm-fpsel-bool` NaN miscompile; the incident that established this knowledge base's verification layer.
+- [`fp-eq-select.md`](fp-eq-select.md) — the flonum-equality select (`%fpsel=`): routing unordered around one emitted instruction with `asm-size*`-computed skips, after the same instruction had been landed dead and removed (the RULE-DEAD incident).
 - [`cmov-fxminmax.md`](cmov-fxminmax.md) — branchless `fxmin`/`fxmax` via `cmp + cmovcc`; aliasing-case dispatch and the modrm operand order; notable for its verification gap (no mats, no path evidence).
 - [`roundsd-flround.md`](roundsd-flround.md) — the `roundsd` family (`flround`/`flfloor`/`flceiling`/`fltruncate`) traced from two local branches through `x86-64-level` capability gating to the landed form; includes a honestly-reported 26% regression.
 - [`magic-divide.md`](magic-divide.md) — fixnum division strength reduction by magic-number mul-high; the Granlund–Montgomery side condition, the compile-time verifier that declines to `idiv`, and three pre-landing bugs found under `gdb`/`setarch -R`.
