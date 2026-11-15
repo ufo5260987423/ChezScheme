@@ -3761,11 +3761,13 @@
         ; branchless-select counterparts of the fp relops, or #f for
         ; any other predicate.  fl>? and fl>=? are swapped onto fp</fp<=
         ; by cpprim, so the only fp pred primitives that can appear here
-        ; are fp<, fp<=, fp=.  fp= is excluded for now: its cmov would
-        ; fire on the unordered ZF=1, and the compensating jp's offset
-        ; has proven fragile under register coalescing, so equality
-        ; selects keep the branchy form until the skip is computed from
-        ; the emitted code rather than a length guess.
+        ; are fp<, fp<=, fp=.  fp= maps to fpsel=: ucomisd sets ZF=1 on
+        ; unordered as well as on ordered-equal, so the emitters route
+        ; the unordered case around the instruction it must not see, or
+        ; to a corrective move, with a skip whose displacement is the
+        ; size of the emitted fragment being routed around (asm-size*)
+        ; rather than a length guess; the inverted equality condition
+        ; would alias on unordered and is never synthesized.
         (define pred->fpsel
           (constant-case setcc-instruction
             [(#t)
@@ -3773,6 +3775,7 @@
                (cond
                  [(eq? prim %fp<) %fpsel<]
                  [(eq? prim %fp<=) %fpsel<=]
+                 [(eq? prim %fp=) %fpsel=]
                  [else #f]))]
             [else (lambda (prim) #f)]))
 
@@ -3798,10 +3801,29 @@
               [else (and (uvar? t) t)])))
         ; both select operands must be of one kind: two immediates use
         ; the immediate instruction clause, two uvars the register
-        ; clause; a mixed pair matches no clause
+        ; clause.  A mixed pair (one uvar, one immediate) is accepted by
+        ; coercing the immediate into a fresh scratch, the same preset
+        ; the immediate clause pays for its then-value; the register
+        ; clause then handles the pair.
         (define select-operands-ok?
           (lambda (a1 a2)
             (or (and (uvar? a1) (uvar? a2)) (and (not (uvar? a1)) (not (uvar? a2))))))
+        ; Coerce a mixed uvar/immediate operand pair by binding the
+        ; immediate to a fresh scratch, returning (values prefix-effect
+        ; op1 op2) with both ops uvars; same-kind pairs pass through
+        ; with no prefix.  #f when the pair is not coercible.
+        (define select-operands-mixed
+          (lambda (a1 a2)
+            (cond
+              [(select-operands-ok? a1 a2)
+               (values (with-output-language (L11 Effect) `(nop)) a1 a2)]
+              [(uvar? a1)
+               (let ([t (make-tmp 's)])
+                 (values (with-output-language (L11 Effect) `(set! ,t ,a2)) a1 t))]
+              [(uvar? a2)
+               (let ([t (make-tmp 's)])
+                 (values (with-output-language (L11 Effect) `(set! ,t ,a1)) t a2))]
+              [else (values #f #f #f)])))
         ; Convert a processed (if (inline pred ...) (set! x t1) (set! x
         ; t2)) with t1/t2 select operands into one set! of a branchless
         ; value instruction, or #f when the shape or predicate has no
@@ -3835,10 +3857,10 @@
                           [a2 (cadr d2)]
                           [sel (or (pred->isel prim) (pred->fpsel prim))])
                      (and sel
-                          (select-operands-ok? a1 a2)
-                          (not (and (uvar? a1) (eq? a1 x)))
-                          (with-output-language (L11 Effect)
-                            `(set! ,x (inline ,null-info ,sel ,t* ... ,a1 ,a2)))))))))
+                          (let-values ([(pfx op1 op2) (select-operands-mixed a1 a2)])
+                            (and pfx
+                                 (with-output-language (L11 Effect)
+                                   `(seq ,pfx (set! ,x (inline ,null-info ,sel ,t* ... ,op1 ,op2))))))))))))
         ; Unwrap a processed Pred of the shape (seq e ... p) when it
         ; ends in a comparison with a branchless-select form, returning
         ; the prefix effects, the final comparison pred, and whether
@@ -3850,6 +3872,9 @@
         ; and calls in test position, which arrive as
         ; (seq ... (if (eq? <tmp> #f) (false) (true))), keep the single
         ; evaluation of the call, with the arms swapping onto the eq?.
+        ; Both select families are accepted: on a flonum compare the
+        ; fpsel family's NaN-takes-else semantics is exactly the source
+        ; branch's false arm, so the swap is sound for fp predicates.
         (define lift-seq-pred
           (lambda (p)
             (let loop ([p p] [pfx '()])
@@ -3861,13 +3886,101 @@
                      (values (reverse pfx) p #f)
                      (values #f #f #f))]
                 [(if (inline ,info ,pred-prim ,t* ...) (false) (true))
-                 (if (pred->isel pred-prim)
+                 (if (or (pred->isel pred-prim) (pred->fpsel pred-prim))
                      (values (reverse pfx)
                              (with-output-language (L11 Pred)
                                `(inline ,info ,pred-prim ,t* ...))
                              #t)
                      (values #f #f #f))]
                 [else (values #f #f #f)]))))
+        ; Recognize the safe-operation wrapper shape
+        ;   (if (if TEST (inline sel-pred ...) FALSEP) t1 t2)
+        ; produced when a safe fixnum/flonum compare is inlined in test
+        ; position, where the caller reassociates by the rule
+        ;   (if (if test cmp fp) t1 t2)
+        ;     => (if test (if cmp t1 t2) (if fp t1 t2))
+        ; This is sound for any false path: fp's truthiness feeds the
+        ; same arm choice, so no assumption that the false-path call
+        ; escapes is needed.  Only the test-true arm is converted to a
+        ; branchless select; the cold arm is built by
+        ; build-flatten-else.
+        (define flatten-safe-pred
+          (lambda (p)
+            ; plain destructure only: e0 is already processed, so
+            ; invoking the Pred processor on the parts here would
+            ; re-materialize pred-primitive inlines (it is not
+            ; idempotent); cf. lift-seq-pred, which matches the same
+            ; way.
+            (nanopass-case (L11 Pred) p
+              [(if ,p0 ,p1 ,p2)
+               (nanopass-case (L11 Pred) p1
+                 [(inline ,info ,pred-prim ,t* ...)
+                  (if (or (pred->isel pred-prim) (pred->fpsel pred-prim))
+                      (values p0 p1 p2)
+                      (values #f #f #f))]
+                 [else (values #f #f #f)])]
+              [else (values #f #f #f)])))
+        ; Decompose a call-in-test-position truthiness pred (the
+        ; predicafy-rhs product) into its effect prefix and the tmp it
+        ; tests, requiring the generator's exact shape.
+        (define match-call-truthiness
+          (lambda (p)
+            (let loop ([p p] [pfx '()])
+              (nanopass-case (L11 Pred) p
+                [(seq ,e0 ,p1)
+                 (loop p1 (cons e0 pfx))]
+                [(if (inline ,info ,pred-prim ,t* ...) (false) (true))
+                 (if (and (eq? pred-prim %eq?)
+                          (fx= (length t*) 2)
+                          (uvar? (car t*)))
+                     (let ([t0 (car t*)])
+                       (nanopass-case (L11 Triv) (cadr t*)
+                         [(immediate ,imm)
+                          (if (eqv? imm (constant sfalse))
+                              (let ([effs (reverse pfx)])
+                                (if (and (pair? effs)
+                                         (nanopass-case (L11 Effect) (car (last-pair effs))
+                                           [(set! ,x ,t) (eq? x t0)]
+                                           [else #f]))
+                                    (values #t effs t0)
+                                    (values #f #f #f)))
+                              (values #f #f #f))]
+                         [else (values #f #f #f)]))
+                     (values #f #f #f))]
+                [else (values #f #f #f)]))))
+        ; Build the else arm of a flattened safe-operation wrapper: the
+        ; cold path with the original arms.  When the cold path is a
+        ; call in pred position that returns (the predicafy-rhs
+        ; product), its truthiness check picks the arm branchlessly,
+        ; exactly as the nested if did; when it escapes, or has any
+        ; other shape, it is kept whole, which is sound for any false
+        ; path: its result feeds the same arm choice through the
+        ; original pred.
+        (define build-flatten-else
+          (lambda (falsep e1 e2)
+            (let-values ([(ok? effs tmp) (match-call-truthiness falsep)])
+              (if ok?
+                  (let ([eqp (with-output-language (L11 Pred)
+                               `(inline ,null-info ,%eq? ,tmp (immediate ,(constant sfalse))))])
+                    (fold-right
+                      (lambda (e rest) (with-output-language (L11 Effect) `(seq ,e ,rest)))
+                      (or (select-if eqp e2 e1)
+                          (with-output-language (L11 Effect) `(if ,eqp ,e2 ,e1)))
+                      effs))
+                  (with-output-language (L11 Effect) `(if ,falsep ,e1 ,e2))))))
+        ; Tail-context counterpart of build-flatten-else
+        (define build-flatten-else-tail
+          (lambda (falsep tl1 tl2)
+            (let-values ([(ok? effs tmp) (match-call-truthiness falsep)])
+              (if ok?
+                  (let ([eqp (with-output-language (L11 Pred)
+                               `(inline ,null-info ,%eq? ,tmp (immediate ,(constant sfalse))))])
+                    (fold-right
+                      (lambda (e rest) (with-output-language (L11 Tail) `(seq ,e ,rest)))
+                      (or (select-tail eqp tl2 tl1)
+                          (with-output-language (L11 Tail) `(if ,eqp ,tl2 ,tl1)))
+                      effs))
+                  (with-output-language (L11 Tail) `(if ,falsep ,tl1 ,tl2))))))
         ; Convert a processed (if (inline pred ...) t1 t2) in tail
         ; position, with t1/t2 select operands, into a select followed
         ; by the selected value, or #f.
@@ -3893,12 +4006,14 @@
                           [t* (cadr pt)]
                           [sel (or (pred->isel prim) (pred->fpsel prim))])
                      (and sel
-                          (select-operands-ok? a1 a2)
-                          (let ([w (make-tmp 'w)])
-                            (with-output-language (L11 Tail)
-                              `(seq
-                                 (set! ,w (inline ,null-info ,sel ,t* ... ,a1 ,a2))
-                                 ,w)))))))))
+                          (let-values ([(pfx op1 op2) (select-operands-mixed a1 a2)])
+                            (and pfx
+                                 (let ([w (make-tmp 'w)])
+                                   (with-output-language (L11 Tail)
+                                     `(seq ,pfx
+                                           (seq
+                                              (set! ,w (inline ,null-info ,sel ,t* ... ,op1 ,op2))
+                                              ,w))))))))))))
         (define rhs-inline
           (lambda (lvalue info prim t*)
             (with-output-language (L11 Effect)
@@ -4016,12 +4131,19 @@
         ; branchless form, everything else falls through to the generic if
         ; production below and keeps the conditional branch
         [(if ,[Pred : e0] ,[e1] ,[e2])
-         (let-values ([(pfx p swap?) (lift-seq-pred e0)])
-           (if p
-               (let ([th (if swap? e2 e1)] [el (if swap? e1 e2)])
-                 (let ([body (or (select-if p th el) `(if ,p ,th ,el))])
-                   (fold-right (lambda (e rest) `(seq ,e ,rest)) body pfx)))
-               (or (select-if e0 e1 e2) `(if ,e0 ,e1 ,e2))))]
+         (let-values ([(test cmp falsep) (flatten-safe-pred e0)]
+                      [(pfx p swap?) (lift-seq-pred e0)])
+           (cond
+             [(and test
+                   (let ([body (select-if cmp e1 e2)])
+                     (and body
+                          (with-output-language (L11 Effect)
+                            `(if ,test ,body ,(build-flatten-else falsep e1 e2))))))]
+             [p
+              (let ([th (if swap? e2 e1)] [el (if swap? e1 e2)])
+                (let ([body (or (select-if p th el) `(if ,p ,th ,el))])
+                  (fold-right (lambda (e rest) `(seq ,e ,rest)) body pfx)))]
+             [else (or (select-if e0 e1 e2) `(if ,e0 ,e1 ,e2))]))]
         [,x `(nop)]
         [(mref ,x1 ,x2 ,imm ,type) `(nop)]
         [(literal ,info) `(nop)]
@@ -4073,12 +4195,19 @@
         ; same general select as the Effect context, for selects in tail
         ; position (e.g. (lambda () (if (fx< a b) 1 2)))
         [(if ,[Pred : e0] ,[tl1] ,[tl2])
-         (let-values ([(pfx p swap?) (lift-seq-pred e0)])
-           (if p
-               (let ([th (if swap? tl2 tl1)] [el (if swap? tl1 tl2)])
-                 (let ([body (or (select-tail p th el) `(if ,p ,th ,el))])
-                   (fold-right (lambda (e rest) `(seq ,e ,rest)) body pfx)))
-               (or (select-tail e0 tl1 tl2) `(if ,e0 ,tl1 ,tl2))))]
+         (let-values ([(test cmp falsep) (flatten-safe-pred e0)]
+                      [(pfx p swap?) (lift-seq-pred e0)])
+           (cond
+             [(and test
+                   (let ([body (select-tail cmp tl1 tl2)])
+                     (and body
+                          (with-output-language (L11 Tail)
+                            `(if ,test ,body ,(build-flatten-else-tail falsep tl1 tl2))))))]
+             [p
+              (let ([th (if swap? tl2 tl1)] [el (if swap? tl1 tl2)])
+                (let ([body (or (select-tail p th el) `(if ,p ,th ,el))])
+                  (fold-right (lambda (e rest) `(seq ,e ,rest)) body pfx)))]
+             [else (or (select-tail e0 tl1 tl2) `(if ,e0 ,tl1 ,tl2))]))]
         [(inline ,info ,prim ,[t*] ...)
          (guard (pred-primitive? prim))
          (let ([sel (or (pred->isel prim) (pred->fpsel prim))])
